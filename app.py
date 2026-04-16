@@ -245,7 +245,7 @@ def create_decade_playlists(access_token, grouped):
             raise requests.HTTPError(response=resp)
         playlist = resp.json()
         for i in range(0, len(uris), 100):
-            add_resp = spotify_request('POST', f"/playlists/{playlist['id']}/tracks", access_token, payload={'uris': uris[i:i+100]})
+            add_resp = spotify_request('POST', f"/playlists/{playlist['id']}/items", access_token, payload={'uris': uris[i:i+100]})
             if add_resp.status_code >= 400:
                 raise requests.HTTPError(response=add_resp)
         results.append({'decade': decade, 'count': len(uris), 'name': playlist['name'], 'url': playlist.get('external_urls', {}).get('spotify', '#')})
