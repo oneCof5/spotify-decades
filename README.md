@@ -70,3 +70,15 @@ Use your normal TLS setup so the public site is served over HTTPS.
 - Put the app behind your existing SSO or a simple access gate if this will be public on the internet.
 - Encrypt stored refresh tokens or move them to a secrets-backed database.
 - Add user-specific cleanup or idempotent update logic for existing decade playlists.
+
+
+## Debugging 403s
+
+This build includes a debug panel and a `/debug` route. It shows:
+
+- The Spotify account returned by `/me`
+- The stored OAuth scopes from the refresh token exchange
+- The account product tier when available
+- A live test call to `POST /me/playlists` and its raw response body
+
+If playlist creation still fails, use **Reset stored token**, log in again, then open the debug panel and inspect `playlist_create_body`.
