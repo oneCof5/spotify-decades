@@ -316,7 +316,7 @@ def create_or_replace_decade_playlists(access_token, profile, grouped):
     for decade, uris in grouped.items():
         if not uris:
             continue
-        playlist = spotify_post(f'/users/{user_id}/playlists', access_token, {
+        playlist = spotify_post('/me/playlists', access_token, {
             'name': f'{PLAYLIST_PREFIX} {decade}',
             'public': PLAYLIST_PUBLIC,
             'description': 'Auto-generated from liked songs by album release decade.',
