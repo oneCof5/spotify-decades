@@ -19,12 +19,15 @@ DB_PATH = os.getenv("DATABASE_PATH", "/data/spotify_decades.db")
 PLAYLIST_PREFIX = os.getenv("PLAYLIST_PREFIX", "My")
 PLAYLIST_PUBLIC = os.getenv("PLAYLIST_PUBLIC", "false").lower() == "true"
 PORT = int(os.getenv("PORT", "8080"))
-# add debug mode
 DEBUG_MODE = os.getenv("APP_DEBUG", "true").lower() == "true"
 
-SCOPES = "user-library-read user-read-private playlist-modify-private playlist-modify-public"
+SCOPES = "user-library-read user-read-private playlist-read-private playlist-modify-private playlist-modify-public"
 SPOTIFY_ACCOUNTS = "https://accounts.spotify.com"
 SPOTIFY_API = "https://api.spotify.com/v1"
+REISSUE_MARKERS = [
+    'remaster', 'remastered', 'deluxe', 'expanded', 'anniversary', 'bonus track',
+    'special edition', 'super deluxe', 'digital', 'edition', 'reissue'
+]
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
@@ -65,7 +68,7 @@ PAGE = """
         {% if not connected %}
           <a class="btn btn-primary" href="{{ url_for('login') }}">Connect Spotify</a>
         {% else %}
-          <a class="btn btn-primary" href="{{ url_for('build_playlists') }}">Create decade playlists</a>
+          <a class="btn btn-primary" href="{{ url_for('build_playlists') }}">Sync decade playlists</a>
           <a class="btn" href="{{ url_for('debug_info') }}">Refresh debug info</a>
           <a class="btn" href="{{ url_for('logout') }}">Disconnect</a>
           <a class="btn" href="{{ url_for('reset_tokens') }}">Reset stored token</a>
@@ -88,9 +91,9 @@ PAGE = """
       <article class="card">
         <h2>Checks</h2>
         <ul>
-          <li>The app uses <code>POST /v1/me/playlists</code>, not the user-id playlist route.</li>
-          <li>The app stores refresh tokens in SQLite and can reset them from the UI.</li>
-          <li>The debug panel shows granted scope, current account, and Spotify product tier.</li>
+          <li>The app uses <code>POST /v1/me/playlists</code> for playlist creation.</li>
+          <li>Existing decade playlists are updated in place instead of duplicated.</li>
+          <li>Original-year mismatches are logged in debug output for review.</li>
         </ul>
       </article>
     </section>
@@ -108,7 +111,22 @@ PAGE = """
     {% endif %}
 
     {% if result_rows %}
-    <section class="card"><h2>Latest run</h2><table><thead><tr><th>Decade</th><th>Tracks</th><th>Playlist</th></tr></thead><tbody>{% for row in result_rows %}<tr><td>{{ row['decade'] }}</td><td>{{ row['count'] }}</td><td><a href="{{ row['url'] }}" target="_blank" rel="noopener noreferrer">{{ row['name'] }}</a></td></tr>{% endfor %}</tbody></table></section>
+    <section class="card">
+      <h2>Latest run</h2>
+      <table>
+        <thead><tr><th>Decade</th><th>Tracks</th><th>Action</th><th>Playlist</th></tr></thead>
+        <tbody>
+          {% for row in result_rows %}
+          <tr>
+            <td>{{ row['decade'] }}</td>
+            <td>{{ row['count'] }}</td>
+            <td>{{ row['action'] }}</td>
+            <td><a href="{{ row['url'] }}" target="_blank" rel="noopener noreferrer">{{ row['name'] }}</a></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
     {% endif %}
 
     {% if debug and debug_enabled %}
@@ -138,7 +156,7 @@ def close_db(exc):
 
 def init_db():
     db = get_db()
-    db.execute("""CREATE TABLE IF NOT EXISTS tokens (spotify_user_id TEXT PRIMARY KEY, refresh_token TEXT NOT NULL, scope TEXT, created_at INTEGER NOT NULL)""")
+    db.execute("CREATE TABLE IF NOT EXISTS tokens (spotify_user_id TEXT PRIMARY KEY, refresh_token TEXT NOT NULL, scope TEXT, created_at INTEGER NOT NULL)")
     db.commit()
 
 
@@ -151,8 +169,14 @@ def spotify_token_request(data):
 
 def spotify_request(method, path, access_token, params=None, payload=None):
     url = path if path.startswith('http') else f"{SPOTIFY_API}{path}"
-    resp = requests.request(method, url, headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}, params=params, json=payload, timeout=30)
-    return resp
+    return requests.request(method, url, headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}, params=params, json=payload, timeout=30)
+
+
+def parse_json(resp):
+    try:
+        return resp.json()
+    except Exception:
+        return {'raw': resp.text}
 
 
 def get_stored_token_row(spotify_user_id):
@@ -168,13 +192,6 @@ def get_access_token_for_user(spotify_user_id):
         get_db().execute('UPDATE tokens SET refresh_token = ? WHERE spotify_user_id = ?', (data['refresh_token'], spotify_user_id))
         get_db().commit()
     return data['access_token']
-
-
-def parse_json(resp):
-    try:
-        return resp.json()
-    except Exception:
-        return {'raw': resp.text}
 
 
 def current_profile():
@@ -200,55 +217,131 @@ def all_saved_tracks(access_token):
         data = resp.json()
         items.extend(data.get('items', []))
         next_url = data.get('next')
-        if next_url:
-            path = next_url
-            params = None
-        else:
-            path = None
+        path = next_url if next_url else None
+        params = None
     return items
 
 
-def decade_from_release_date(release_date):
-    year = int(release_date[:4])
+def decade_from_year(year):
     return f"{year // 10 * 10}s"
 
 
-def group_tracks(saved_items):
+def infer_original_year(track, access_token):
+    album = track.get('album') or {}
+    release_date = album.get('release_date')
+    candidate_years = []
+    if release_date and len(release_date) >= 4 and release_date[:4].isdigit():
+        candidate_years.append(int(release_date[:4]))
+
+    title = (track.get('name') or '').lower()
+    album_name = (album.get('name') or '').lower()
+    has_reissue_marker = any(marker in title or marker in album_name for marker in REISSUE_MARKERS)
+    artists = track.get('artists') or []
+    primary_artist = artists[0].get('name') if artists else None
+
+    if has_reissue_marker and primary_artist and track.get('name'):
+        try:
+            search_query = f"track:{track['name']} artist:{primary_artist}"
+            resp = spotify_request('GET', '/search', access_token, params={'q': search_query, 'type': 'track', 'limit': 10})
+            if resp.status_code < 400:
+                data = resp.json()
+                for item in data.get('tracks', {}).get('items', []):
+                    item_album = item.get('album') or {}
+                    item_date = item_album.get('release_date')
+                    if not item_date or len(item_date) < 4 or not item_date[:4].isdigit():
+                        continue
+                    item_artists = [a.get('name', '').lower() for a in item.get('artists', [])]
+                    if primary_artist.lower() in item_artists:
+                        candidate_years.append(int(item_date[:4]))
+        except Exception:
+            pass
+
+    return min(candidate_years) if candidate_years else None
+
+
+def group_tracks(saved_items, access_token):
     decades = defaultdict(list)
     seen = set()
+    diagnostics = []
     for item in saved_items:
         track = item.get('track') or {}
         if track.get('is_local') or not track.get('id') or not track.get('uri'):
             continue
         if track['id'] in seen:
             continue
+        original_year = infer_original_year(track, access_token)
+        if not original_year:
+            continue
         album = track.get('album') or {}
         release_date = album.get('release_date')
-        if not release_date or len(release_date) < 4 or not release_date[:4].isdigit():
-            continue
-        decades[decade_from_release_date(release_date)].append(track['uri'])
+        release_year = int(release_date[:4]) if release_date and len(release_date) >= 4 and release_date[:4].isdigit() else None
+        if release_year and original_year != release_year:
+            diagnostics.append({'track': track.get('name'), 'album': album.get('name'), 'release_year': release_year, 'original_year': original_year})
+        decades[decade_from_year(original_year)].append(track['uri'])
         seen.add(track['id'])
-    return dict(sorted(decades.items()))
+    return dict(sorted(decades.items())), diagnostics
 
 
-def create_decade_playlists(access_token, grouped):
+def get_current_user_playlists(access_token, owner_id):
+    playlists = []
+    path = '/me/playlists'
+    params = {'limit': 50}
+    while path:
+        resp = spotify_request('GET', path, access_token, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        for item in data.get('items', []):
+            owner = item.get('owner') or {}
+            if owner.get('id') == owner_id:
+                playlists.append(item)
+        next_url = data.get('next')
+        path = next_url if next_url else None
+        params = None
+    return playlists
+
+
+def find_existing_playlists(access_token, owner_id):
+    return {(playlist.get('name') or '').strip(): playlist for playlist in get_current_user_playlists(access_token, owner_id)}
+
+
+def update_playlist_details(access_token, playlist_id, name, description):
+    resp = spotify_request('PUT', f'/playlists/{playlist_id}', access_token, payload={'name': name, 'public': PLAYLIST_PUBLIC, 'description': description})
+    if resp.status_code >= 400:
+        raise requests.HTTPError(response=resp)
+
+
+def replace_playlist_items(access_token, playlist_id, uris):
+    first_chunk = uris[:100]
+    resp = spotify_request('PUT', f'/playlists/{playlist_id}/items', access_token, payload={'uris': first_chunk})
+    if resp.status_code >= 400:
+        raise requests.HTTPError(response=resp)
+    for i in range(100, len(uris), 100):
+        add_resp = spotify_request('POST', f'/playlists/{playlist_id}/items', access_token, payload={'uris': uris[i:i+100]})
+        if add_resp.status_code >= 400:
+            raise requests.HTTPError(response=add_resp)
+
+
+def create_or_update_decade_playlists(access_token, profile, grouped):
     results = []
+    owner_id = profile['id']
+    existing = find_existing_playlists(access_token, owner_id)
     for decade, uris in grouped.items():
         if not uris:
             continue
-        resp = spotify_request('POST', '/me/playlists', access_token, payload={
-            'name': f'{PLAYLIST_PREFIX} {decade}',
-            'public': PLAYLIST_PUBLIC,
-            'description': 'Auto-generated from liked songs by album release decade.',
-        })
-        if resp.status_code >= 400:
-            raise requests.HTTPError(response=resp)
-        playlist = resp.json()
-        for i in range(0, len(uris), 100):
-            add_resp = spotify_request('POST', f"/playlists/{playlist['id']}/items", access_token, payload={'uris': uris[i:i+100]})
-            if add_resp.status_code >= 400:
-                raise requests.HTTPError(response=add_resp)
-        results.append({'decade': decade, 'count': len(uris), 'name': playlist['name'], 'url': playlist.get('external_urls', {}).get('spotify', '#')})
+        playlist_name = f'{PLAYLIST_PREFIX} {decade}'
+        description = 'Auto-generated from liked songs by inferred original release decade.'
+        playlist = existing.get(playlist_name)
+        action = 'updated'
+        if playlist:
+            update_playlist_details(access_token, playlist['id'], playlist_name, description)
+        else:
+            resp = spotify_request('POST', '/me/playlists', access_token, payload={'name': playlist_name, 'public': PLAYLIST_PUBLIC, 'description': description})
+            if resp.status_code >= 400:
+                raise requests.HTTPError(response=resp)
+            playlist = resp.json()
+            action = 'created'
+        replace_playlist_items(access_token, playlist['id'], uris)
+        results.append({'decade': decade, 'count': len(uris), 'name': playlist_name, 'url': playlist.get('external_urls', {}).get('spotify', '#'), 'action': action})
     return results
 
 
@@ -271,11 +364,7 @@ def build_debug_snapshot(spotify_user_id=None):
     if spotify_user_id:
         row = get_stored_token_row(spotify_user_id)
         if row:
-            snap['db'] = {
-                'spotify_user_id': row['spotify_user_id'],
-                'stored_scope': row['scope'],
-                'created_at_epoch': row['created_at'],
-            }
+            snap['db'] = {'spotify_user_id': row['spotify_user_id'], 'stored_scope': row['scope'], 'created_at_epoch': row['created_at']}
         try:
             access_token = get_access_token_for_user(spotify_user_id)
             me_resp = spotify_request('GET', '/me', access_token)
@@ -287,23 +376,25 @@ def build_debug_snapshot(spotify_user_id=None):
             if test_create.status_code < 400:
                 created = test_create.json()
                 snap['playlist_create_success_id'] = created.get('id')
+                test_add = spotify_request('POST', f"/playlists/{created['id']}/items", access_token, payload={'uris': []})
+                snap['playlist_add_items_status'] = test_add.status_code
+                snap['playlist_add_items_body'] = parse_json(test_add)
         except requests.HTTPError as exc:
             snap['error'] = {'status_code': exc.response.status_code if exc.response is not None else None, 'body': parse_json(exc.response) if exc.response is not None else str(exc)}
         except Exception as exc:
             snap['error'] = {'message': str(exc)}
+    if session.get('year_diagnostics'):
+        snap['year_diagnostics'] = session.get('year_diagnostics')[:50]
     return json.dumps(snap, indent=2)
-
 
 @app.before_request
 def ensure_db():
     init_db()
 
-
 @app.route('/')
 def index():
     profile = current_profile()
     return render_template_string(PAGE, app_name=APP_NAME, connected=bool(profile), profile=profile, redirect_uri=SPOTIFY_REDIRECT_URI, playlist_public=PLAYLIST_PUBLIC, scopes=SCOPES, debug_enabled=DEBUG_MODE, message=session.pop('flash_message', None), message_class=session.pop('flash_class', ''), result_rows=session.pop('latest_results', None), debug=session.get('debug_blob'))
-
 
 @app.route('/login')
 def login():
@@ -315,7 +406,6 @@ def login():
     session['oauth_state'] = state
     params = {'client_id': SPOTIFY_CLIENT_ID, 'response_type': 'code', 'redirect_uri': SPOTIFY_REDIRECT_URI, 'scope': SCOPES, 'state': state, 'show_dialog': 'true'}
     return redirect(f"{SPOTIFY_ACCOUNTS}/authorize?{urlencode(params)}")
-
 
 @app.route('/callback')
 def callback():
@@ -342,14 +432,13 @@ def callback():
         session['flash_message'] = 'Spotify did not return a refresh token.'
         session['flash_class'] = 'msg-err'
         return redirect(url_for('index'))
-    get_db().execute("""INSERT INTO tokens (spotify_user_id, refresh_token, scope, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(spotify_user_id) DO UPDATE SET refresh_token = excluded.refresh_token, scope = excluded.scope, created_at = excluded.created_at""", (me['id'], refresh_token, data.get('scope', ''), int(time.time())))
+    get_db().execute("INSERT INTO tokens (spotify_user_id, refresh_token, scope, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(spotify_user_id) DO UPDATE SET refresh_token = excluded.refresh_token, scope = excluded.scope, created_at = excluded.created_at", (me['id'], refresh_token, data.get('scope', ''), int(time.time())))
     get_db().commit()
     session['spotify_user_id'] = me['id']
     session['debug_blob'] = build_debug_snapshot(me['id']) if DEBUG_MODE else None
     session['flash_message'] = f"Connected Spotify account for {me.get('display_name') or me['id']}."
     session['flash_class'] = 'msg-ok'
     return redirect(url_for('index'))
-
 
 @app.route('/build-playlists')
 def build_playlists():
@@ -360,11 +449,15 @@ def build_playlists():
         return redirect(url_for('index'))
     try:
         access_token = get_access_token_for_user(spotify_user_id)
+        profile_resp = spotify_request('GET', '/me', access_token)
+        profile_resp.raise_for_status()
+        profile = profile_resp.json()
         saved = all_saved_tracks(access_token)
-        grouped = group_tracks(saved)
-        results = create_decade_playlists(access_token, grouped)
+        grouped, diagnostics = group_tracks(saved, access_token)
+        results = create_or_update_decade_playlists(access_token, profile, grouped)
         session['latest_results'] = results
-        session['flash_message'] = f"Created {len(results)} playlist(s) from {len(saved)} liked tracks scanned."
+        session['year_diagnostics'] = diagnostics[:50]
+        session['flash_message'] = f"Processed {len(results)} playlist(s) from {len(saved)} liked tracks scanned."
         session['flash_class'] = 'msg-ok'
     except requests.HTTPError as exc:
         body = parse_json(exc.response) if exc.response is not None else str(exc)
@@ -377,7 +470,6 @@ def build_playlists():
     session['debug_blob'] = build_debug_snapshot(spotify_user_id) if DEBUG_MODE else None
     return redirect(url_for('index'))
 
-
 @app.route('/debug')
 def debug_info():
     spotify_user_id = session.get('spotify_user_id')
@@ -385,7 +477,6 @@ def debug_info():
     session['flash_message'] = 'Debug snapshot refreshed.'
     session['flash_class'] = 'msg-ok'
     return redirect(url_for('index'))
-
 
 @app.route('/reset-tokens')
 def reset_tokens():
@@ -398,14 +489,12 @@ def reset_tokens():
     session['flash_class'] = 'msg-warn'
     return redirect(url_for('index'))
 
-
 @app.route('/logout')
 def logout():
     session.clear()
     session['flash_message'] = 'Session cleared. Stored refresh tokens remain unless reset separately.'
     session['flash_class'] = 'msg-warn'
     return redirect(url_for('index'))
-
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=PORT)

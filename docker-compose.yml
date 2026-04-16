@@ -12,6 +12,7 @@ services:
       PLAYLIST_PREFIX: ${PLAYLIST_PREFIX:-My}
       PLAYLIST_PUBLIC: ${PLAYLIST_PUBLIC:-false}
       APP_NAME: ${APP_NAME:-Spotify Decades}
+      APP_DEBUG: ${APP_NAME:-false}
     volumes:
       - spotify-decades-data:/data
     restart: unless-stopped

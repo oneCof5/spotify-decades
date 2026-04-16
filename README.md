@@ -1,84 +1,26 @@
 # Spotify Decades Docker Service
 
-This container runs a small Flask web app that handles Spotify OAuth redirects at a hosted URL such as `https://spotify-decades.mydomain.com/callback` and then builds playlists from your liked songs grouped by release decade.
+This container runs a small Flask web app that handles Spotify OAuth redirects at a hosted URL such as `https://spotify-decades.mydomain.com/callback` and then syncs playlists from your liked songs grouped by decade.
 
-## What it does
+## What changed
 
-- Hosts `/login` to start Spotify Authorization Code flow
-- Hosts `/callback` as the exact redirect URI Spotify sends users back to
-- Stores Spotify refresh tokens in a SQLite database mounted at `/data`
-- Refreshes access tokens automatically before Spotify API calls
-- Creates one playlist per decade from your liked tracks
+- Existing playlists like `My 1970s` are reused instead of duplicated.
+- Playlist contents are replaced in place, then topped up in batches over 100 items.
+- The app uses `/playlists/{id}/items` for playlist item updates.
+- A heuristic tries to infer an earlier original release year for remasters and deluxe editions.
+- Debug output includes year-mismatch diagnostics.
 
-## Spotify app setup
+## Playlist sync behavior
 
-1. Go to the Spotify Developer Dashboard and create an app.
-2. Add this exact Redirect URI to the app:
-   - `https://spotify-decades.mydomain.com/callback`
-3. Copy the Client ID and Client Secret into `.env`.
+The app reads the current user playlists, filters to playlists owned by the connected user, and matches by exact playlist name. If `My 1980s` already exists, it updates that playlist and replaces its full track list. If it does not exist, the app creates it.
 
-The redirect URI must exactly match the value configured in the authorize request and token exchange, including scheme, host, path, casing, and trailing slash behavior.
+## Original release year heuristic
 
-## Local build
+Spotify’s standard saved-tracks data exposes album `release_date`, but that often reflects a remaster, deluxe release, or digital reissue instead of the earliest release. Spotify’s Web API does not expose a simple universal `original_release_year` field in the saved-tracks response, so this app uses best-effort logic:
 
-```bash
-docker compose up --build -d
-```
+- Start with the track’s album `release_date` year.
+- If the track title or album title contains markers like `Remastered`, `Deluxe`, `Expanded`, `Anniversary`, or `Reissue`, search Spotify for alternate catalog matches with the same track and primary artist.
+- Pick the earliest matching year found.
+- Record mismatches in the debug panel for review.
 
-The app listens on port `8080` inside the container.
-
-## Reverse proxy example
-
-Put Nginx, Traefik, Caddy, or your existing ingress in front of the container and forward `spotify-decades.mydomain.com` to `http://spotify-decades:8080` or to the Docker host port.
-
-### Nginx example
-
-```nginx
-server {
-    listen 80;
-    server_name spotify-decades.mydomain.com;
-
-    location / {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
-}
-```
-
-Use your normal TLS setup so the public site is served over HTTPS.
-
-## Run flow
-
-1. Open `https://spotify-decades.mydomain.com`
-2. Click **Connect Spotify**
-3. Approve access in Spotify
-4. Spotify redirects back to `/callback`
-5. Click **Create decade playlists**
-
-## Notes
-
-- The service requests `user-library-read`, `playlist-modify-private`, and `playlist-modify-public`.
-- Access tokens expire after about one hour, so the app stores and uses a refresh token for future API calls.
-- Playlist grouping is based on the album `release_date` returned by Spotify.
-- The current implementation creates new playlists on each run instead of updating existing ones.
-
-## Hardening ideas
-
-- Put the app behind your existing SSO or a simple access gate if this will be public on the internet.
-- Encrypt stored refresh tokens or move them to a secrets-backed database.
-- Add user-specific cleanup or idempotent update logic for existing decade playlists.
-
-
-## Debugging 403s
-
-This build includes a debug panel and a `/debug` route. It shows:
-
-- The Spotify account returned by `/me`
-- The stored OAuth scopes from the refresh token exchange
-- The account product tier when available
-- A live test call to `POST /me/playlists` and its raw response body
-
-If playlist creation still fails, use **Reset stored token**, log in again, then open the debug panel and inspect `playlist_create_body`.
+This improves many obvious remaster cases, but it is not perfect. The most accurate next step would be enriching Spotify tracks with MusicBrainz or Discogs data and caching canonical release years.
