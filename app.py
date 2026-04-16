@@ -19,6 +19,7 @@ DB_PATH = os.getenv("DATABASE_PATH", "/data/spotify_decades.db")
 PLAYLIST_PREFIX = os.getenv("PLAYLIST_PREFIX", "My")
 PLAYLIST_PUBLIC = os.getenv("PLAYLIST_PUBLIC", "false").lower() == "true"
 PORT = int(os.getenv("PORT", "8080"))
+# add debug mode
 DEBUG_MODE = os.getenv("APP_DEBUG", "true").lower() == "true"
 
 SCOPES = "user-library-read user-read-private playlist-modify-private playlist-modify-public"
