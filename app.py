@@ -391,24 +391,27 @@ def run_mb_sync_next():
         cursor = MB_CURSOR_STATE.get(spotify_user_id, session.get("mb_sync_cursor"))
 
         if MB_BACKGROUND_ENABLED:
-            # Fire‑and‑forget background batch using a thread.
+            # Fire-and-forget background batch using a thread WITH app context.
             def worker(user_id: str, cursor_val: str | None):
-                try:
-                    summary = sync_next_musicbrainz_batch(
-                        limit=MB_BATCH_SIZE, cursor=cursor_val
-                    )
-                    MB_CURSOR_STATE[user_id] = summary.get("next_cursor")
-                    logger.info(
-                        "Background MB batch for %s: %s",
-                        user_id,
-                        summary,
-                    )
-                except Exception as exc_inner:
-                    logger.exception(
-                        "Background MB batch failed for %s: %s",
-                        user_id,
-                        exc_inner,
-                    )
+                from app import app  # if this code is in a different module; otherwise not needed
+
+                with app.app_context():
+                    try:
+                        summary = sync_next_musicbrainz_batch(
+                            limit=MB_BATCH_SIZE, cursor=cursor_val
+                        )
+                        MB_CURSOR_STATE[user_id] = summary.get("next_cursor")
+                        logger.info(
+                            "Background MB batch for %s: %s",
+                            user_id,
+                            summary,
+                        )
+                    except Exception as exc_inner:
+                        logger.exception(
+                            "Background MB batch failed for %s: %s",
+                            user_id,
+                            exc_inner,
+                        )
 
             threading.Thread(
                 target=worker, args=(spotify_user_id, cursor), daemon=True
