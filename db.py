@@ -147,9 +147,15 @@ def init_db():
     db.commit()
 
 
-def upsert_token(provider: str, account_id: str, refresh_token: str | None = None,
-                 access_token: str | None = None, token_type: str | None = None,
-                 scope: str | None = None, expires_at: int | None = None):
+def upsert_token(
+    provider: str,
+    account_id: str,
+    refresh_token: str | None = None,
+    access_token: str | None = None,
+    token_type: str | None = None,
+    scope: str | None = None,
+    expires_at: int | None = None,
+):
     db = get_db()
     db.execute(
         """
@@ -163,7 +169,16 @@ def upsert_token(provider: str, account_id: str, refresh_token: str | None = Non
           expires_at = COALESCE(excluded.expires_at, tokens.expires_at),
           created_at = excluded.created_at
         """,
-        (provider, account_id, refresh_token, access_token, token_type, scope, expires_at, int(time.time())),
+        (
+            provider,
+            account_id,
+            refresh_token,
+            access_token,
+            token_type,
+            scope,
+            expires_at,
+            int(time.time()),
+        ),
     )
     db.commit()
 
@@ -217,12 +232,21 @@ def save_spotify_track(spotify_user_id: str, item: dict):
           updated_at = excluded.updated_at
         """,
         (
-            track["id"], track["uri"], track.get("name"), track.get("duration_ms"),
-            int(bool(track.get("explicit"))), track.get("popularity"),
-            track.get("track_number"), track.get("disc_number"),
-            external_ids.get("isrc"), album.get("id"), album.get("name"),
-            album.get("release_date"), album.get("release_date_precision"),
-            json.dumps(track), now,
+            track["id"],
+            track["uri"],
+            track.get("name"),
+            track.get("duration_ms"),
+            int(bool(track.get("explicit"))),
+            track.get("popularity"),
+            track.get("track_number"),
+            track.get("disc_number"),
+            external_ids.get("isrc"),
+            album.get("id"),
+            album.get("name"),
+            album.get("release_date"),
+            album.get("release_date_precision"),
+            json.dumps(track),
+            now,
         ),
     )
 
@@ -237,7 +261,13 @@ def save_spotify_track(spotify_user_id: str, item: dict):
               name = excluded.name,
               updated_at = excluded.updated_at
             """,
-            (artist["id"], artist.get("name", "Unknown Artist"), artist["id"], artist["id"], now),
+            (
+                artist["id"],
+                artist.get("name", "Unknown Artist"),
+                artist["id"],
+                artist["id"],
+                now,
+            ),
         )
         db.execute(
             "INSERT INTO track_artists (spotify_track_id, spotify_artist_id, artist_order) VALUES (?, ?, ?)",
@@ -274,7 +304,12 @@ def get_unhydrated_artist_ids(limit: int = 50):
     return [r[0] for r in rows]
 
 
-def get_tracks_for_enrichment_after(limit: int = 100, cursor: str | None = None, selected_ids: list[str] | None = None, include_matched: bool = False):
+def get_tracks_for_enrichment_after(
+    limit: int = 100,
+    cursor: str | None = None,
+    selected_ids: list[str] | None = None,
+    include_matched: bool = False,
+):
     db = get_db()
     where = "WHERE 1=1"
     params: list = []
@@ -286,7 +321,7 @@ def get_tracks_for_enrichment_after(limit: int = 100, cursor: str | None = None,
         where += " AND (mm.spotify_track_id IS NULL OR mm.status IN ('pending', 'failed'))"
     if cursor:
         where += " AND (st.name, st.spotify_track_id) > (?, ?)"
-        params.extend([cursor_name_from_cursor(cursor), cursor])
+        params.extend([cursor_name_from_cursor(cursor), cursor.split("::", 1)[1] if "::" in cursor else cursor])
     params.append(limit)
     return db.execute(
         f"""
@@ -338,8 +373,15 @@ def get_pending_musicbrainz_count(after_cursor: str | None = None):
     ).fetchone()[0]
 
 
-def upsert_mb_match(spotify_track_id: str, match_method: str, mb_recording_id: str | None,
-                    mb_release_group_id: str | None, score: float, status: str, last_error: str | None = None):
+def upsert_mb_match(
+    spotify_track_id: str,
+    match_method: str,
+    mb_recording_id: str | None,
+    mb_release_group_id: str | None,
+    score: float,
+    status: str,
+    last_error: str | None = None,
+):
     get_db().execute(
         """
         INSERT INTO mb_track_matches (
@@ -354,7 +396,16 @@ def upsert_mb_match(spotify_track_id: str, match_method: str, mb_recording_id: s
           last_error = excluded.last_error,
           updated_at = excluded.updated_at
         """,
-        (spotify_track_id, match_method, mb_recording_id, mb_release_group_id, score, status, last_error, int(time.time())),
+        (
+            spotify_track_id,
+            match_method,
+            mb_recording_id,
+            mb_release_group_id,
+            score,
+            status,
+            last_error,
+            int(time.time()),
+        ),
     )
 
 
@@ -410,7 +461,10 @@ def upsert_mb_release_group(release_group: dict):
 
 def replace_track_genres(spotify_track_id: str, genres: list[tuple[str, str, float]]):
     db = get_db()
-    db.execute("DELETE FROM track_genres WHERE spotify_track_id = ? AND source != 'override'", (spotify_track_id,))
+    db.execute(
+        "DELETE FROM track_genres WHERE spotify_track_id = ? AND source != 'override'",
+        (spotify_track_id,),
+    )
     for genre, source, weight in genres:
         db.execute(
             "INSERT OR REPLACE INTO track_genres (spotify_track_id, genre, source, weight) VALUES (?, ?, ?, ?)",
