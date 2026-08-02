@@ -4,18 +4,46 @@ services:
     container_name: spotify-decades
     ports:
       - "8080:8080"
+    env_file:
+      - .env
     environment:
-      SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID}
-      SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET}
-      SPOTIFY_REDIRECT_URI: ${SPOTIFY_REDIRECT_URI}
-      FLASK_SECRET_KEY: ${FLASK_SECRET_KEY}
-      PLAYLIST_PREFIX: ${PLAYLIST_PREFIX:-My}
-      PLAYLIST_PUBLIC: ${PLAYLIST_PUBLIC:-false}
-      APP_NAME: ${APP_NAME:-Spotify Decades}
-      APP_DEBUG: ${APP_NAME:-false}
+      APP_NAME: Spotify Decades Plus
+      APP_DEBUG: "false"
+      PORT: "8080"
+      DATABASE_PATH: /data/spotify_decades.db
+      LOG_PATH: /logs/app.log
+      PLAYLIST_PREFIX: My
+      PLAYLIST_PUBLIC: "false"
+      SPOTIFY_REDIRECT_URI: http://localhost:8080/callback
+      MUSICBRAINZ_REDIRECT_URI: http://localhost:8080/musicbrainz/callback
+      SPOTIFY_CLIENT_ID_FILE: /run/secrets/spotify_client_id
+      SPOTIFY_CLIENT_SECRET_FILE: /run/secrets/spotify_client_secret
+      FLASK_SECRET_KEY_FILE: /run/secrets/flask_secret_key
+      MUSICBRAINZ_CLIENT_ID_FILE: /run/secrets/musicbrainz_client_id
+      MUSICBRAINZ_CLIENT_SECRET_FILE: /run/secrets/musicbrainz_client_secret
+      MUSICBRAINZ_USER_AGENT_FILE: /run/secrets/musicbrainz_user_agent
+    secrets:
+      - spotify_client_id
+      - spotify_client_secret
+      - flask_secret_key
+      - musicbrainz_client_id
+      - musicbrainz_client_secret
+      - musicbrainz_user_agent
     volumes:
-      - spotify-decades-data:/data
+      - ./data:/data
+      - ./logs:/logs
     restart: unless-stopped
 
-volumes:
-  spotify-decades-data:
+secrets:
+  spotify_client_id:
+    file: ./secrets/spotify_client_id.txt
+  spotify_client_secret:
+    file: ./secrets/spotify_client_secret.txt
+  flask_secret_key:
+    file: ./secrets/flask_secret_key.txt
+  musicbrainz_client_id:
+    file: ./secrets/musicbrainz_client_id.txt
+  musicbrainz_client_secret:
+    file: ./secrets/musicbrainz_client_secret.txt
+  musicbrainz_user_agent:
+    file: ./secrets/musicbrainz_user_agent.txt
