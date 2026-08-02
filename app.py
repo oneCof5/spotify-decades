@@ -1,283 +1,127 @@
-import base64
 import json
 import logging
 import os
 import secrets
-import sqlite3
-import time
-from collections import defaultdict
-from urllib.parse import urlencode
+from flask import Flask, redirect, render_template_string, request, session, url_for
+from db import close_db, env_or_file, get_db, get_token_row, get_track_detail, get_track_override_genres, get_unmatched_tracks, init_db, replace_genre_overrides, upsert_token
+from musicbrainz_oauth import MUSICBRAINZ_CLIENT_ID, MUSICBRAINZ_REDIRECT_URI, build_mb_authorize_url, exchange_mb_code, refresh_mb_token
+from playlist_builder import build_playlist_buckets, sync_bucket_playlists
+from spotify_client import SCOPES, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_REDIRECT_URI, build_authorize_url, get_me, spotify_token_request
+from sync import enrich_selected_tracks, reclassify_track, sync_all_musicbrainz, sync_artist_metadata, sync_saved_library
 
-import requests
-from flask import Flask, g, redirect, render_template_string, request, session, url_for
-
-# ---- Config ----
-
-APP_NAME = os.getenv("APP_NAME", "Spotify Decades")
-SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
-SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
-SPOTIFY_REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI", "http://localhost:8080/callback")
-SECRET_KEY = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
-DB_PATH = os.getenv("DATABASE_PATH", "/data/spotify_decades.db")
-PLAYLIST_PREFIX = os.getenv("PLAYLIST_PREFIX", "My")
-PLAYLIST_PUBLIC = os.getenv("PLAYLIST_PUBLIC", "false").lower() == "true"
-PORT = int(os.getenv("PORT", "8080"))
-DEBUG_MODE = os.getenv("APP_DEBUG", "true").lower() == "true"
-LOG_PATH = os.getenv("LOG_PATH", "/logs/app.log")
-
-SCOPES = (
-    "user-library-read "
-    "user-read-private "
-    "playlist-read-private "
-    "playlist-modify-private "
-    "playlist-modify-public"
-)
-SPOTIFY_ACCOUNTS = "https://accounts.spotify.com"
-SPOTIFY_API = "https://api.spotify.com/v1"
-
-# ---- Logging (stdout + /logs/app.log) ----
+APP_NAME = env_or_file("APP_NAME", "Spotify Decades Plus")
+SECRET_KEY = env_or_file("FLASK_SECRET_KEY", secrets.token_hex(32))
+PLAYLIST_PREFIX = env_or_file("PLAYLIST_PREFIX", "My")
+PLAYLIST_PUBLIC = env_or_file("PLAYLIST_PUBLIC", "false").lower() == "true"
+PORT = int(env_or_file("PORT", "8080"))
+DEBUG_MODE = env_or_file("APP_DEBUG", "false").lower() == "true"
+LOG_PATH = env_or_file("LOG_PATH", "/logs/app.log")
 
 os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
-
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s in %(module)s: %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_PATH),
-        logging.StreamHandler(),
-    ],
+    handlers=[logging.FileHandler(LOG_PATH), logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
 
-# ---- Flask app ----
-
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
+app.teardown_appcontext(close_db)
 
 PAGE = """
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{ app_name }}</title>
-  <style>
-    :root { color-scheme: light dark; --bg:#0f1115; --surface:#171a20; --muted:#a7b0be; --text:#f3f6fb; --accent:#1db954; --accent2:#15883d; --border:#2a2f38; --danger:#ff6b6b; --warning:#f4c95d; --ok:#79d48f; }
-    @media (prefers-color-scheme: light) { :root { --bg:#f6f8fb; --surface:#ffffff; --muted:#566072; --text:#111827; --accent:#1db954; --accent2:#168f42; --border:#dbe2ea; --danger:#c0392b; --warning:#9a6b00; --ok:#1f7a36; } }
-    * { box-sizing: border-box; }
-    body { margin:0; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
-    .wrap { max-width: 1080px; margin: 0 auto; padding: 28px 18px 56px; }
-    .hero,.card { background: var(--surface); border:1px solid var(--border); border-radius:18px; box-shadow:0 10px 30px rgba(0,0,0,.08); }
-    .hero { padding:28px; margin-bottom:20px; }
-    .card { padding:20px; margin-bottom:16px; }
-    h1,h2,h3 { margin:0 0 12px; line-height:1.15; }
-    p { margin:0 0 12px; color: var(--muted); }
-    .actions { display:flex; gap:12px; flex-wrap:wrap; margin-top:16px; }
-    .btn { display:inline-flex; align-items:center; justify-content:center; min-height:44px; padding:0 16px; border-radius:12px; text-decoration:none; border:1px solid var(--border); color:var(--text); font-weight:600; }
-    .btn-primary { background:var(--accent); color:#08130c; border-color:transparent; }
-    .btn-primary:hover { background:var(--accent2); }
-    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:16px; }
-    .pill { display:inline-block; padding:6px 10px; border-radius:999px; background:rgba(29,185,84,.14); font-size:14px; }
-    .kv { display:grid; grid-template-columns:220px 1fr; gap:8px 12px; }
-    .kv div { padding:8px 0; border-bottom:1px solid var(--border); }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
-    .msg-ok { color:var(--ok); }
-    .msg-warn { color:var(--warning); }
-    .msg-err { color:var(--danger); }
-    table { width:100%; border-collapse:collapse; }
-    th,td { text-align:left; padding:10px 8px; border-bottom:1px solid var(--border); vertical-align:top; }
-    th { color:var(--text); }
-    .small { font-size:14px; }
-    pre { background:#0b0d11; color:#d6e2f0; border-radius:14px; padding:14px; overflow:auto; border:1px solid var(--border); font-size:13px; }
-    code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <section class="hero">
-      <span class="pill">Spotify Web API</span>
-      <h1>{{ app_name }}</h1>
-      <p>Connect your Spotify account, scan your liked songs, and sync playlists grouped by decade using a hosted redirect URL.</p>
-      <div class="actions">
-        {% if not connected %}
-          <a class="btn btn-primary" href="{{ url_for('login') }}">Connect Spotify</a>
-        {% else %}
-          <a class="btn btn-primary" href="{{ url_for('build_playlists') }}">Sync decade playlists</a>
-          <a class="btn" href="{{ url_for('debug_info') }}">Refresh debug info</a>
-          <a class="btn" href="{{ url_for('logout') }}">Disconnect</a>
-          <a class="btn" href="{{ url_for('reset_tokens') }}">Reset stored token</a>
-        {% endif %}
-      </div>
-    </section>
-
-    {% if message %}
-    <section class="card">
-      <h2>Status</h2>
-      <p class="{{ message_class }}">{{ message }}</p>
-    </section>
-    {% endif %}
-
-    <section class="grid">
-      <article class="card">
-        <h2>Deployment</h2>
-        <div class="kv small">
-          <div>Redirect URI</div><div class="mono">{{ redirect_uri }}</div>
-          <div>Playlist visibility</div><div>{{ 'Public' if playlist_public else 'Private' }}</div>
-          <div>Scopes requested</div><div class="mono">{{ scopes }}</div>
-          <div>Debug mode</div><div>{{ debug_enabled }}</div>
-        </div>
-      </article>
-      <article class="card">
-        <h2>Checks</h2>
-        <ul>
-          <li>Uses <code>/me/playlists</code> and <code>/playlists/{id}/items</code> for idempotent sync.</li>
-          <li>Existing decade playlists are updated instead of duplicated.</li>
-          <li>Debug panel shows scopes, account, and playlist create/add tests.</li>
-        </ul>
-      </article>
-    </section>
-
-    {% if connected and profile %}
-    <section class="card">
-      <h2>Connected account</h2>
-      <div class="kv">
-        <div>User</div><div>{{ profile.get('display_name') or profile.get('id') }}</div>
-        <div>Spotify ID</div><div class="mono">{{ profile.get('id') }}</div>
-        <div>Product</div><div>{{ profile.get('product', 'Unavailable') }}</div>
-        <div>Email</div><div>{{ profile.get('email', 'Not shared') }}</div>
-      </div>
-    </section>
-    {% endif %}
-
-    {% if result_rows %}
-    <section class="card">
-      <h2>Latest run</h2>
-      <table>
-        <thead>
-          <tr><th>Decade</th><th>Tracks</th><th>Action</th><th>Playlist</th></tr>
-        </thead>
-        <tbody>
-          {% for row in result_rows %}
-          <tr>
-            <td>{{ row['decade'] }}</td>
-            <td>{{ row['count'] }}</td>
-            <td>{{ row['action'] }}</td>
-            <td><a href="{{ row['url'] }}" target="_blank" rel="noopener noreferrer">{{ row['name'] }}</a></td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </section>
-    {% endif %}
-
-    {% if debug and debug_enabled %}
-    <section class="card">
-      <h2>Debug</h2>
-      <pre>{{ debug }}</pre>
-    </section>
-    {% endif %}
-  </div>
-</body>
-</html>
+<!doctype html><html><head><meta charset='utf-8'><title>{{ app_name }}</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#111827;color:#f9fafb;margin:0}.wrap{max-width:1180px;margin:0 auto;padding:24px}.card{background:#1f2937;border:1px solid #374151;border-radius:16px;padding:20px;margin-bottom:16px}.row{display:flex;gap:10px;flex-wrap:wrap}a.btn,button.btn{display:inline-block;padding:10px 14px;border-radius:12px;background:#22c55e;color:#06270f;text-decoration:none;font-weight:700;margin:0 10px 10px 0;border:0;cursor:pointer}.btn-alt{background:#cbd5e1;color:#111827}.muted{color:#9ca3af}table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid #374151;text-align:left;vertical-align:top}pre{white-space:pre-wrap;background:#0b1220;padding:12px;border-radius:12px}.small{font-size:14px}
+</style></head><body><div class='wrap'>
+<div class='card'><h1>{{ app_name }}</h1><p class='muted'>Sync liked songs into SQLite, enrich with MusicBrainz, build playlists, and review unmatched tracks manually.</p>
+{% if not connected %}<a class='btn' href='{{ url_for("login") }}'>Connect Spotify</a>{% else %}
+<div class='row'>
+<a class='btn' href='{{ url_for("run_sync") }}'>1. Sync library</a>
+<a class='btn' href='{{ url_for("run_mb_sync_all") }}'>2. Sync all with MusicBrainz</a>
+<a class='btn' href='{{ url_for("build_all_playlists") }}'>3. Build playlists</a>
+<a class='btn btn-alt' href='{{ url_for("admin_unmatched") }}'>Admin: unmatched</a>
+<a class='btn btn-alt' href='{{ url_for("mb_login") }}'>MusicBrainz OAuth</a>
+<a class='btn btn-alt' href='{{ url_for("logout") }}'>Disconnect</a>
+</div>{% endif %}</div>
+{% if message %}<div class='card'><strong>Status:</strong> {{ message }}</div>{% endif %}
+{% if profile %}<div class='card'><h2>Connected account</h2><p>{{ profile.get('display_name') or profile.get('id') }} ({{ profile.get('id') }})</p></div>{% endif %}
+{% if result_rows %}<div class='card'><h2>Latest playlist sync</h2><table><thead><tr><th>Type</th><th>Label</th><th>Tracks</th><th>Action</th><th>Playlist</th></tr></thead><tbody>{% for row in result_rows %}<tr><td>{{ row['type'] }}</td><td>{{ row['label'] }}</td><td>{{ row['count'] }}</td><td>{{ row['action'] }}</td><td><a href='{{ row['url'] }}' target='_blank' rel='noopener noreferrer'>{{ row['name'] }}</a></td></tr>{% endfor %}</tbody></table></div>{% endif %}
+{% if debug and debug_enabled %}<div class='card'><h2>Debug</h2><pre>{{ debug }}</pre></div>{% endif %}
+</div></body></html>
 """
 
-# ---- DB helpers ----
+ADMIN_PAGE = """
+<!doctype html><html><head><meta charset='utf-8'><title>Admin - {{ app_name }}</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#111827;color:#f9fafb;margin:0}.wrap{max-width:1280px;margin:0 auto;padding:24px}.card{background:#1f2937;border:1px solid #374151;border-radius:16px;padding:20px;margin-bottom:16px}a.btn,button.btn{display:inline-block;padding:10px 14px;border-radius:12px;background:#22c55e;color:#06270f;text-decoration:none;font-weight:700;border:0;cursor:pointer}.btn-alt{background:#cbd5e1;color:#111827}table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid #374151;text-align:left;vertical-align:top}.muted{color:#9ca3af}input[type=text]{width:100%;padding:10px;border-radius:10px;border:1px solid #4b5563;background:#0b1220;color:#f9fafb}.small{font-size:14px}.mono{font-family:ui-monospace,SFMono-Regular,monospace}
+</style></head><body><div class='wrap'>
+<div class='card'><h1>Admin: unmatched tracks</h1><p class='muted'>Review unresolved MusicBrainz matches, run selected enrichment, and apply manual genre overrides.</p><a class='btn btn-alt' href='{{ url_for("index") }}'>Back</a></div>
+{% if message %}<div class='card'><strong>Status:</strong> {{ message }}</div>{% endif %}
+<div class='card'><form method='post' action='{{ url_for("enrich_selected_route") }}'><table><thead><tr><th>Select</th><th>Track</th><th>Artists</th><th>Album / Year</th><th>Match status</th><th>Overrides</th><th>Actions</th></tr></thead><tbody>
+{% for row in rows %}
+<tr>
+<td><input type='checkbox' name='track_ids' value='{{ row["spotify_track_id"] }}'></td>
+<td><div><strong>{{ row['name'] }}</strong></div><div class='small mono'>{{ row['spotify_track_id'] }}</div><div class='small muted'>ISRC: {{ row['isrc'] or '—' }}</div></td>
+<td>{{ row['artist_names'] or '—' }}</td>
+<td>{{ row['album_name'] or '—' }}<div class='small muted'>{{ row['album_release_date'] or '—' }}</div></td>
+<td>{{ row['status'] or 'not attempted' }}<div class='small muted'>score: {{ row['score'] if row['score'] is not none else '—' }}</div><div class='small muted'>{{ row['last_error'] or '' }}</div></td>
+<td><input type='text' form='override-{{ row["spotify_track_id"] }}' name='genres' value='{{ row["override_csv"] }}' placeholder='Alternative, Heavy Metal'></td>
+<td>
+<form id='override-{{ row["spotify_track_id"] }}' method='post' action='{{ url_for("save_override", spotify_track_id=row["spotify_track_id"]) }}'></form>
+<button class='btn' form='override-{{ row["spotify_track_id"] }}' type='submit'>Save override</button>
+<a class='btn btn-alt' href='{{ url_for("track_detail", spotify_track_id=row["spotify_track_id"]) }}'>Details</a>
+</td>
+</tr>
+{% endfor %}
+</tbody></table><div style='margin-top:16px'><button class='btn' type='submit'>Enrich selected tracks</button></div></form></div></div></body></html>
+"""
 
-def get_db():
-    if "db" not in g:
-        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-        g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row
-    return g.db
-
-
-@app.teardown_appcontext
-def close_db(exc):
-    db = g.pop("db", None)
-    if db is not None:
-        db.close()
-
-
-def init_db():
-    db = get_db()
-    db.execute(
-#if not suitable, I'll just provide the app.py patch with instructions—no external references.
-
-        "CREATE TABLE IF NOT EXISTS tokens ("
-        "spotify_user_id TEXT PRIMARY KEY,"
-        "refresh_token TEXT NOT NULL,"
-        "scope TEXT,"
-        "created_at INTEGER NOT NULL)"
-    )
-    db.commit()
-
-# ---- Spotify helpers ----
-
-def spotify_token_request(data: dict) -> dict:
-    auth = base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()).decode()
-    resp = requests.post(
-        f"{SPOTIFY_ACCOUNTS}/api/token",
-        data=data,
-        headers={
-            "Authorization": f"Basic {auth}",
-            "Content-Type": "application/x-www-form-urlencoded",
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def spotify_request(method: str, path: str, access_token: str, params=None, payload=None):
-    url = path if path.startswith("http") else f"{SPOTIFY_API}{path}"
-    logger.info("Spotify %s %s", method, url)
-    return requests.request(
-        method,
-        url,
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-        },
-        params=params,
-        json=payload,
-        timeout=30,
-    )
-
-
-def parse_json(resp):
-    try:
-        return resp.json()
-    except Exception:
-        return {"raw": resp.text}
-
-
-def get_stored_token_row(spotify_user_id: str):
-    return (
-        get_db()
-        .execute(
-            "SELECT spotify_user_id, refresh_token, scope, created_at "
-            "FROM tokens WHERE spotify_user_id = ?",
-            (spotify_user_id,),
-        )
-        .fetchone()
-    )
-
+DETAIL_PAGE = """
+<!doctype html><html><head><meta charset='utf-8'><title>Track detail - {{ app_name }}</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#111827;color:#f9fafb;margin:0}.wrap{max-width:1000px;margin:0 auto;padding:24px}.card{background:#1f2937;border:1px solid #374151;border-radius:16px;padding:20px;margin-bottom:16px}a.btn{display:inline-block;padding:10px 14px;border-radius:12px;background:#22c55e;color:#06270f;text-decoration:none;font-weight:700;border:0;cursor:pointer}.btn-alt{background:#cbd5e1;color:#111827}pre{white-space:pre-wrap;background:#0b1220;padding:12px;border-radius:12px}.muted{color:#9ca3af}
+</style></head><body><div class='wrap'>
+<div class='card'><h1>{{ detail['name'] }}</h1><p class='muted'>Track detail and current classification inputs.</p><a class='btn btn-alt' href='{{ url_for("admin_unmatched") }}'>Back</a> <a class='btn' href='{{ url_for("reclassify_route", spotify_track_id=detail["spotify_track_id"]) }}'>Reclassify now</a> <a class='btn' href='{{ url_for("enrich_one_route", spotify_track_id=detail["spotify_track_id"]) }}'>Search MusicBrainz now</a></div>
+<div class='card'><h2>Current record</h2><pre>{{ pretty }}</pre></div>
+</div></body></html>
+"""
 
 def get_access_token_for_user(spotify_user_id: str) -> str:
-    row = get_stored_token_row(spotify_user_id)
+    row = get_token_row("spotify", spotify_user_id)
     if not row:
-        raise RuntimeError("No refresh token stored for this user.")
-    data = spotify_token_request(
-        {"grant_type": "refresh_token", "refresh_token": row["refresh_token"]}
+        raise RuntimeError("No Spotify refresh token stored for this user.")
+    data = spotify_token_request({"grant_type": "refresh_token", "refresh_token": row["refresh_token"]})
+    upsert_token(
+        "spotify",
+        spotify_user_id,
+        refresh_token=data.get("refresh_token") or row["refresh_token"],
+        access_token=data.get("access_token"),
+        token_type=data.get("token_type"),
+        scope=row["scope"] or data.get("scope"),
+        expires_at=None,
     )
-    if data.get("refresh_token"):
-        get_db().execute(
-            "UPDATE tokens SET refresh_token = ? WHERE spotify_user_id = ?",
-            (data["refresh_token"], spotify_user_id),
-        )
-        get_db().commit()
     return data["access_token"]
 
+def get_musicbrainz_access_token() -> str | None:
+    row = get_token_row("musicbrainz", "self")
+    if not row:
+        return None
+    if row["access_token"]:
+        return row["access_token"]
+    if row["refresh_token"]:
+        data = refresh_mb_token(row["refresh_token"])
+        upsert_token(
+            "musicbrainz",
+            "self",
+            refresh_token=data.get("refresh_token") or row["refresh_token"],
+            access_token=data.get("access_token"),
+            token_type=data.get("token_type"),
+            scope=data.get("scope"),
+            expires_at=None,
+        )
+        return data.get("access_token")
+    return None
 
 def current_profile():
     spotify_user_id = session.get("spotify_user_id")
@@ -285,163 +129,14 @@ def current_profile():
         return None
     try:
         token = get_access_token_for_user(spotify_user_id)
-        resp = spotify_request("GET", "/me", token)
-        resp.raise_for_status()
-        return resp.json()
+        return get_me(token)
     except Exception as exc:
         logger.exception("current_profile failed: %s", exc)
         return None
 
-
-def all_saved_tracks(access_token: str):
-    items = []
-    path = "/me/tracks"
-    params = {"limit": 50}
-    while path:
-        resp = spotify_request("GET", path, access_token, params=params)
-        resp.raise_for_status()
-        data = resp.json()
-        items.extend(data.get("items", []))
-        next_url = data.get("next")
-        path = next_url if next_url else None
-        params = None
-    return items
-
-# ---- Decade grouping (simple year only) ----
-
-def decade_from_year(year: int) -> str:
-    return f"{year // 10 * 10}s"
-
-
-def infer_original_year(track: dict):
-    """Simplified: use album.release_date year only, no /search calls."""
-    album = track.get("album") or {}
-    release_date = album.get("release_date")
-    if release_date and len(release_date) >= 4 and release_date[:4].isdigit():
-        return int(release_date[:4])
-    return None
-
-
-def group_tracks(saved_items):
-    decades = defaultdict(list)
-    seen = set()
-    for item in saved_items:
-        track = item.get("track") or {}
-        if track.get("is_local") or not track.get("id") or not track.get("uri"):
-            continue
-        if track["id"] in seen:
-            continue
-        year = infer_original_year(track)
-        if year is None:
-            continue
-        decades[decade_from_year(year)].append(track["uri"])
-        seen.add(track["id"])
-    return dict(sorted(decades.items()))
-
-# ---- Playlist sync (idempotent create/update) ----
-
-def get_current_user_playlists(access_token: str, owner_id: str):
-    playlists = []
-    path = "/me/playlists"
-    params = {"limit": 50}
-    while path:
-        resp = spotify_request("GET", path, access_token, params=params)
-        resp.raise_for_status()
-        data = resp.json()
-        for item in data.get("items", []):
-            owner = item.get("owner") or {}
-            if owner.get("id") == owner_id:
-                playlists.append(item)
-        next_url = data.get("next")
-        path = next_url if next_url else None
-        params = None
-    return playlists
-
-
-def find_existing_playlists(access_token: str, owner_id: str):
-    return {
-        (playlist.get("name") or "").strip(): playlist
-        for playlist in get_current_user_playlists(access_token, owner_id)
-    }
-
-
-def update_playlist_details(access_token: str, playlist_id: str, name: str, description: str):
-    resp = spotify_request(
-        "PUT",
-        f"/playlists/{playlist_id}",
-        access_token,
-        payload={"name": name, "public": PLAYLIST_PUBLIC, "description": description},
-    )
-    if resp.status_code >= 400:
-        raise requests.HTTPError(response=resp)
-
-
-def replace_playlist_items(access_token: str, playlist_id: str, uris: list[str]):
-    # Replace all items with first batch (up to 100)
-    first_chunk = uris[:100]
-    resp = spotify_request(
-        "PUT",
-        f"/playlists/{playlist_id}/items",
-        access_token,
-        payload={"uris": first_chunk},
-    )
-    if resp.status_code >= 400:
-        raise requests.HTTPError(response=resp)
-    # Append remaining items
-    for i in range(100, len(uris), 100):
-        add_resp = spotify_request(
-            "POST",
-            f"/playlists/{playlist_id}/items",
-            access_token,
-            payload={"uris": uris[i : i + 100]},
-        )
-        if add_resp.status_code >= 400:
-            raise requests.HTTPError(response=add_resp)
-
-
-def create_or_update_decade_playlists(access_token: str, profile: dict, grouped: dict):
-    results = []
-    owner_id = profile["id"]
-    existing = find_existing_playlists(access_token, owner_id)
-    for decade, uris in grouped.items():
-        if not uris:
-            continue
-        playlist_name = f"{PLAYLIST_PREFIX} {decade}"
-        description = "Auto-generated from liked songs by album release decade."
-        playlist = existing.get(playlist_name)
-        action = "updated"
-        if playlist:
-            update_playlist_details(access_token, playlist["id"], playlist_name, description)
-        else:
-            resp = spotify_request(
-                "POST",
-                "/me/playlists",
-                access_token,
-                payload={
-                    "name": playlist_name,
-                    "public": PLAYLIST_PUBLIC,
-                    "description": description,
-                },
-            )
-            if resp.status_code >= 400:
-                raise requests.HTTPError(response=resp)
-            playlist = resp.json()
-            action = "created"
-        replace_playlist_items(access_token, playlist["id"], uris)
-        results.append(
-            {
-                "decade": decade,
-                "count": len(uris),
-                "name": playlist_name,
-                "url": playlist.get("external_urls", {}).get("spotify", "#"),
-                "action": action,
-            }
-        )
-    return results
-
-# ---- Debug snapshot (no year diagnostics) ----
-
 def build_debug_snapshot(spotify_user_id=None):
+    if not spotify_user_id:
+        spotify_user_id = session.get("spotify_user_id")
     snap = {
         "env": {
             "redirect_uri": SPOTIFY_REDIRECT_URI,
@@ -449,62 +144,29 @@ def build_debug_snapshot(spotify_user_id=None):
             "requested_scopes": SCOPES,
             "client_id_present": bool(SPOTIFY_CLIENT_ID),
             "client_secret_present": bool(SPOTIFY_CLIENT_SECRET),
+            "musicbrainz_client_id_present": bool(MUSICBRAINZ_CLIENT_ID),
+            "musicbrainz_redirect_uri": MUSICBRAINZ_REDIRECT_URI,
         },
         "session": {
-            "spotify_user_id": session.get("spotify_user_id"),
-            "oauth_state_present": bool(session.get("oauth_state")),
+            "spotify_user_id": spotify_user_id,
+            "musicbrainz_connected": bool(get_musicbrainz_access_token()),
         },
     }
-    if not spotify_user_id:
-        spotify_user_id = session.get("spotify_user_id")
     if spotify_user_id:
-        row = get_stored_token_row(spotify_user_id)
-        if row:
-            snap["db"] = {
-                "spotify_user_id": row["spotify_user_id"],
-                "stored_scope": row["scope"],
-                "created_at_epoch": row["created_at"],
-            }
-        try:
-            access_token = get_access_token_for_user(spotify_user_id)
-            me_resp = spotify_request("GET", "/me", access_token)
-            snap["api_me_status"] = me_resp.status_code
-            snap["api_me_body"] = parse_json(me_resp)
-            test_create = spotify_request(
-                "POST",
-                "/me/playlists",
-                access_token,
-                payload={
-                    "name": f"{PLAYLIST_PREFIX} debug test",
-                    "public": False,
-                    "description": "Temporary test playlist for diagnostics.",
-                },
-            )
-            snap["playlist_create_status"] = test_create.status_code
-            snap["playlist_create_body"] = parse_json(test_create)
-            if test_create.status_code < 400:
-                created = test_create.json()
-                snap["playlist_create_success_id"] = created.get("id")
-                test_add = spotify_request(
-                    "POST", f"/playlists/{created['id']}/items", access_token, payload={"uris": []}
-                )
-                snap["playlist_add_items_status"] = test_add.status_code
-                snap["playlist_add_items_body"] = parse_json(test_add)
-        except requests.HTTPError as exc:
-            snap["error"] = {
-                "status_code": exc.response.status_code if exc.response is not None else None,
-                "body": parse_json(exc.response) if exc.response is not None else str(exc),
-            }
-        except Exception as exc:
-            snap["error"] = {"message": str(exc)}
+        counts = {
+            "saved_tracks": get_db().execute("SELECT COUNT(*) FROM saved_tracks").fetchone()[0],
+            "spotify_tracks": get_db().execute("SELECT COUNT(*) FROM spotify_tracks").fetchone()[0],
+            "spotify_artists": get_db().execute("SELECT COUNT(*) FROM spotify_artists").fetchone()[0],
+            "matched_tracks": get_db().execute("SELECT COUNT(*) FROM mb_track_matches WHERE status = 'matched'").fetchone()[0],
+            "classified_genres": get_db().execute("SELECT COUNT(*) FROM track_genres").fetchone()[0],
+            "override_tracks": get_db().execute("SELECT COUNT(DISTINCT spotify_track_id) FROM genre_overrides").fetchone()[0],
+        }
+        snap["db_counts"] = counts
     return json.dumps(snap, indent=2)
-
-# ---- Routes ----
 
 @app.before_request
 def ensure_db():
     init_db()
-
 
 @app.route("/")
 def index():
@@ -514,140 +176,192 @@ def index():
         app_name=APP_NAME,
         connected=bool(profile),
         profile=profile,
-        redirect_uri=SPOTIFY_REDIRECT_URI,
-        playlist_public=PLAYLIST_PUBLIC,
-        scopes=SCOPES,
         debug_enabled=DEBUG_MODE,
         message=session.pop("flash_message", None),
-        message_class=session.pop("flash_class", ""),
         result_rows=session.pop("latest_results", None),
         debug=session.get("debug_blob"),
     )
 
-
 @app.route("/login")
 def login():
     if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
-        session["flash_message"] = "Missing Spotify client credentials in the container environment."
-        session["flash_class"] = "msg-err"
+        session["flash_message"] = "Missing Spotify credentials in environment."
         return redirect(url_for("index"))
     state = secrets.token_urlsafe(24)
     session["oauth_state"] = state
-    params = {
-        "client_id": SPOTIFY_CLIENT_ID,
-        "response_type": "code",
-        "redirect_uri": SPOTIFY_REDIRECT_URI,
-        "scope": SCOPES,
-        "state": state,
-        "show_dialog": "true",
-    }
-    return redirect(f"{SPOTIFY_ACCOUNTS}/authorize?{urlencode(params)}")
-
+    return redirect(build_authorize_url(state))
 
 @app.route("/callback")
 def callback():
-    if request.args.get("error"):
-        session["flash_message"] = f"Spotify authorization failed: {request.args['error']}"
-        session["flash_class"] = "msg-err"
-        return redirect(url_for("index"))
     if request.args.get("state") != session.get("oauth_state"):
-        session["flash_message"] = "OAuth state mismatch. Login was rejected for safety."
-        session["flash_class"] = "msg-err"
+        session["flash_message"] = "OAuth state mismatch."
         return redirect(url_for("index"))
     code = request.args.get("code")
     if not code:
         session["flash_message"] = "Spotify did not return an authorization code."
-        session["flash_class"] = "msg-err"
         return redirect(url_for("index"))
-    data = spotify_token_request(
-        {"grant_type": "authorization_code", "code": code, "redirect_uri": SPOTIFY_REDIRECT_URI}
+    data = spotify_token_request({"grant_type": "authorization_code", "code": code, "redirect_uri": SPOTIFY_REDIRECT_URI})
+    me = get_me(data["access_token"])
+    upsert_token(
+        "spotify",
+        me["id"],
+        refresh_token=data.get("refresh_token"),
+        access_token=data.get("access_token"),
+        token_type=data.get("token_type"),
+        scope=data.get("scope", ""),
+        expires_at=None,
     )
-    access_token = data["access_token"]
-    refresh_token = data.get("refresh_token")
-    me_resp = spotify_request("GET", "/me", access_token)
-    me_resp.raise_for_status()
-    me = me_resp.json()
-    if not refresh_token:
-        session["flash_message"] = "Spotify did not return a refresh token."
-        session["flash_class"] = "msg-err"
-        return redirect(url_for("index"))
-    get_db().execute(
-        "INSERT INTO tokens (spotify_user_id, refresh_token, scope, created_at) "
-        "VALUES (?, ?, ?, ?) "
-        "ON CONFLICT(spotify_user_id) DO UPDATE SET "
-        "refresh_token = excluded.refresh_token, "
-        "scope = excluded.scope, "
-        "created_at = excluded.created_at",
-        (me["id"], refresh_token, data.get("scope", ""), int(time.time())),
-    )
-    get_db().commit()
     session["spotify_user_id"] = me["id"]
     session["debug_blob"] = build_debug_snapshot(me["id"]) if DEBUG_MODE else None
     session["flash_message"] = f"Connected Spotify account for {me.get('display_name') or me['id']}."
-    session["flash_class"] = "msg-ok"
     return redirect(url_for("index"))
 
+@app.route("/musicbrainz/login")
+def mb_login():
+    if not MUSICBRAINZ_CLIENT_ID or not MUSICBRAINZ_REDIRECT_URI:
+        session["flash_message"] = "Missing MusicBrainz OAuth environment variables."
+        return redirect(url_for("index"))
+    state = secrets.token_urlsafe(24)
+    session["mb_oauth_state"] = state
+    return redirect(build_mb_authorize_url(state))
 
-@app.route("/build-playlists")
-def build_playlists():
+@app.route("/musicbrainz/callback")
+def mb_callback():
+    if request.args.get("state") != session.get("mb_oauth_state"):
+        session["flash_message"] = "MusicBrainz OAuth state mismatch."
+        return redirect(url_for("index"))
+    if request.args.get("error"):
+        session["flash_message"] = f"MusicBrainz authorization failed: {request.args.get('error')}"
+        return redirect(url_for("index"))
+    code = request.args.get("code")
+    if not code:
+        session["flash_message"] = "MusicBrainz did not return an authorization code."
+        return redirect(url_for("index"))
+    token_data = exchange_mb_code(code)
+    upsert_token(
+        "musicbrainz",
+        "self",
+        refresh_token=token_data.get("refresh_token"),
+        access_token=token_data.get("access_token"),
+        token_type=token_data.get("token_type"),
+        scope=token_data.get("scope"),
+        expires_at=None,
+    )
+    session["flash_message"] = "MusicBrainz OAuth connected. Public lookups work without it, but authenticated access is now available."
+    return redirect(url_for("index"))
+
+@app.route("/run-sync")
+def run_sync():
     spotify_user_id = session.get("spotify_user_id")
     if not spotify_user_id:
         session["flash_message"] = "Connect Spotify first."
-        session["flash_class"] = "msg-warn"
         return redirect(url_for("index"))
     try:
-        access_token = get_access_token_for_user(spotify_user_id)
-        profile_resp = spotify_request("GET", "/me", access_token)
-        profile_resp.raise_for_status()
-        profile = profile_resp.json()
-        saved = all_saved_tracks(access_token)
-        grouped = group_tracks(saved)
-        results = create_or_update_decade_playlists(access_token, profile, grouped)
-        session["latest_results"] = results
-        session["flash_message"] = f"Processed {len(results)} playlist(s) from {len(saved)} liked tracks scanned."
-        session["flash_class"] = "msg-ok"
-    except requests.HTTPError as exc:
-        body = parse_json(exc.response) if exc.response is not None else str(exc)
-        code = exc.response.status_code if exc.response is not None else "unknown"
-        logger.exception("Spotify API error during build_playlists: %s", body)
-        session["flash_message"] = f"Spotify API error: {code} {json.dumps(body)}"
-        session["flash_class"] = "msg-err"
+        token = get_access_token_for_user(spotify_user_id)
+        saved_summary = sync_saved_library(token, spotify_user_id)
+        artist_summary = sync_artist_metadata(token)
+        session["flash_message"] = f"Synced {saved_summary['saved_tracks']} liked tracks and updated {artist_summary['artists_updated']} artists."
     except Exception as exc:
-        logger.exception("build_playlists failed: %s", exc)
-        session["flash_message"] = f"Run failed: {exc}"
-        session["flash_class"] = "msg-err"
+        logger.exception("run_sync failed: %s", exc)
+        session["flash_message"] = f"Sync failed: {exc}"
     session["debug_blob"] = build_debug_snapshot(spotify_user_id) if DEBUG_MODE else None
     return redirect(url_for("index"))
 
-
-@app.route("/debug")
-def debug_info():
+@app.route("/run-mb-sync-all")
+def run_mb_sync_all():
     spotify_user_id = session.get("spotify_user_id")
-    session["debug_blob"] = build_debug_snapshot(spotify_user_id) if DEBUG_MODE else "Debug disabled"
-    session["flash_message"] = "Debug snapshot refreshed."
-    session["flash_class"] = "msg-ok"
+    if not spotify_user_id:
+        session["flash_message"] = "Connect Spotify first."
+        return redirect(url_for("index"))
+    try:
+        summary = sync_all_musicbrainz(limit=100000)
+        session["flash_message"] = f"MusicBrainz sync complete: enriched {summary['tracks_enriched']} tracks, failed {summary['tracks_failed']} tracks, scanned {summary['tracks_scanned']} total."
+    except Exception as exc:
+        logger.exception("run_mb_sync_all failed: %s", exc)
+        session["flash_message"] = f"MusicBrainz sync failed: {exc}"
+    session["debug_blob"] = build_debug_snapshot(spotify_user_id) if DEBUG_MODE else None
     return redirect(url_for("index"))
 
-
-@app.route("/reset-tokens")
-def reset_tokens():
+@app.route("/build-playlists")
+def build_all_playlists():
     spotify_user_id = session.get("spotify_user_id")
-    if spotify_user_id:
-        get_db().execute("DELETE FROM tokens WHERE spotify_user_id = ?", (spotify_user_id,))
-        get_db().commit()
-    session.clear()
-    session["flash_message"] = "Stored token deleted. Log in again to authorize a fresh token."
-    session["flash_class"] = "msg-warn"
+    if not spotify_user_id:
+        session["flash_message"] = "Connect Spotify first."
+        return redirect(url_for("index"))
+    try:
+        token = get_access_token_for_user(spotify_user_id)
+        profile = get_me(token)
+        buckets = build_playlist_buckets(spotify_user_id)
+        results = []
+        results.extend(sync_bucket_playlists(token, profile, PLAYLIST_PREFIX, PLAYLIST_PUBLIC, "decade", buckets["decade"]))
+        results.extend(sync_bucket_playlists(token, profile, PLAYLIST_PREFIX, PLAYLIST_PUBLIC, "genre", buckets["genre"]))
+        results.extend(sync_bucket_playlists(token, profile, PLAYLIST_PREFIX, PLAYLIST_PUBLIC, "combo", buckets["combo"]))
+        session["latest_results"] = results
+        session["flash_message"] = f"Built {len(results)} playlists across decade, genre, and combo buckets."
+    except Exception as exc:
+        logger.exception("build_all_playlists failed: %s", exc)
+        session["flash_message"] = f"Playlist build failed: {exc}"
+    session["debug_blob"] = build_debug_snapshot(spotify_user_id) if DEBUG_MODE else None
     return redirect(url_for("index"))
 
+@app.route("/admin/unmatched")
+def admin_unmatched():
+    spotify_user_id = session.get("spotify_user_id")
+    if not spotify_user_id:
+        session["flash_message"] = "Connect Spotify first."
+        return redirect(url_for("index"))
+    rows = []
+    for row in get_unmatched_tracks():
+        row = dict(row)
+        row["artist_names"] = " / ".join((row.get("artist_names") or "").split("|||")) if row.get("artist_names") else ""
+        row["override_csv"] = ", ".join(get_track_override_genres(row["spotify_track_id"]))
+        rows.append(row)
+    return render_template_string(ADMIN_PAGE, app_name=APP_NAME, rows=rows, message=session.pop("flash_message", None))
+
+@app.post("/admin/enrich-selected")
+def enrich_selected_route():
+    track_ids = request.form.getlist("track_ids")
+    if not track_ids:
+        session["flash_message"] = "No tracks selected."
+        return redirect(url_for("admin_unmatched"))
+    summary = enrich_selected_tracks(track_ids)
+    session["flash_message"] = f"Selected enrichment complete: enriched {summary['tracks_enriched']}, failed {summary['tracks_failed']}."
+    return redirect(url_for("admin_unmatched"))
+
+@app.route("/admin/track/<spotify_track_id>")
+def track_detail(spotify_track_id):
+    detail = get_track_detail(spotify_track_id)
+    if not detail:
+        session["flash_message"] = "Track not found."
+        return redirect(url_for("admin_unmatched"))
+    return render_template_string(DETAIL_PAGE, app_name=APP_NAME, detail=detail, pretty=json.dumps(dict(detail), indent=2))
+
+@app.post("/admin/track/<spotify_track_id>/override")
+def save_override(spotify_track_id):
+    genres_csv = request.form.get("genres", "")
+    genres = [g.strip() for g in genres_csv.split(",") if g.strip()]
+    replace_genre_overrides(spotify_track_id, genres)
+    reclassify_track(spotify_track_id)
+    session["flash_message"] = f"Saved {len(genres)} override genre(s) for {spotify_track_id}."
+    return redirect(url_for("admin_unmatched"))
+
+@app.route("/admin/track/<spotify_track_id>/reclassify")
+def reclassify_route(spotify_track_id):
+    result = reclassify_track(spotify_track_id)
+    session["flash_message"] = f"Reclassified {spotify_track_id} into {', '.join([g[0] for g in result['genres']]) or 'no genres'}."
+    return redirect(url_for("track_detail", spotify_track_id=spotify_track_id))
+
+@app.route("/admin/track/<spotify_track_id>/enrich")
+def enrich_one_route(spotify_track_id):
+    summary = enrich_selected_tracks([spotify_track_id])
+    session["flash_message"] = f"Track enrichment complete: enriched {summary['tracks_enriched']}, failed {summary['tracks_failed']}."
+    return redirect(url_for("track_detail", spotify_track_id=spotify_track_id))
 
 @app.route("/logout")
 def logout():
     session.clear()
-    session["flash_message"] = "Session cleared. Stored refresh tokens remain unless reset separately."
-    session["flash_class"] = "msg-warn"
+    session["flash_message"] = "Session cleared."
     return redirect(url_for("index"))
 
-
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+    app.run(host="0.0.0.0", port=PORT, debug=DEBUG_MODE)
