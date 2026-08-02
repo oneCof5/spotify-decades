@@ -388,39 +388,60 @@ def run_mb_sync_next():
         return redirect(url_for("index"))
 
     try:
+        # Use in-memory cursor if present, fall back to session.
         cursor = MB_CURSOR_STATE.get(spotify_user_id, session.get("mb_sync_cursor"))
 
         if MB_BACKGROUND_ENABLED:
-            # Fire-and-forget background batch using a thread WITH app context.
-            def worker(user_id: str, cursor_val: str | None):
-                from app import app  # if this code is in a different module; otherwise not needed
-
+            # Background worker: process ALL remaining tracks, batch-by-batch, in linear sync fashion.
+            def worker(user_id: str, start_cursor: str | None):
+                # IMPORTANT: run inside app context so get_db()/g work.
                 with app.app_context():
-                    try:
-                        summary = sync_next_musicbrainz_batch(
-                            limit=MB_BATCH_SIZE, cursor=cursor_val
-                        )
-                        MB_CURSOR_STATE[user_id] = summary.get("next_cursor")
+                    cursor_val = start_cursor
+                    while True:
+                        try:
+                            summary = sync_next_musicbrainz_batch(
+                                limit=MB_BATCH_SIZE,
+                                cursor=cursor_val,
+                            )
+                        except Exception as exc_inner:
+                            logger.exception(
+                                "Background full MB sync failed for %s at cursor %r: %s",
+                                user_id,
+                                cursor_val,
+                                exc_inner,
+                            )
+                            break
+
+                        # Update cursor and global state.
+                        cursor_val = summary.get("next_cursor")
+                        MB_CURSOR_STATE[user_id] = cursor_val
+
                         logger.info(
                             "Background MB batch for %s: %s",
                             user_id,
                             summary,
                         )
-                    except Exception as exc_inner:
-                        logger.exception(
-                            "Background MB batch failed for %s: %s",
-                            user_id,
-                            exc_inner,
-                        )
+
+                        # Stop when there is nothing left to scan or no pending remaining.
+                        if (
+                            summary.get("tracks_scanned", 0) == 0
+                            or summary.get("pending_remaining", 0) == 0
+                        ):
+                            logger.info(
+                                "Background full MB sync complete for %s; cursor=%r",
+                                user_id,
+                                cursor_val,
+                            )
+                            break
 
             threading.Thread(
                 target=worker, args=(spotify_user_id, cursor), daemon=True
             ).start()
             session["flash_message"] = (
-                "Queued MusicBrainz batch in background; refresh to see progress."
+                "Queued full MusicBrainz sync in background; it will process all remaining tracks sequentially."
             )
         else:
-            # Synchronous batch (safer, more predictable).
+            # Single synchronous batch (manual click per batch).
             summary = sync_next_musicbrainz_batch(
                 limit=MB_BATCH_SIZE,
                 cursor=cursor,
