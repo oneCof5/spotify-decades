@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import secrets
-from flask import Flask, redirect, render_template_string, request, session, url_for
+from flask import Flask, redirect, render_template_string, request, session, url_for, jsonify
 from db import close_db, env_or_file, get_db, get_token_row, get_track_detail, get_track_override_genres, get_unmatched_tracks, init_db, replace_genre_overrides, upsert_token
 from musicbrainz_oauth import MUSICBRAINZ_CLIENT_ID, MUSICBRAINZ_REDIRECT_URI, build_mb_authorize_url, exchange_mb_code, refresh_mb_token
 from playlist_builder import build_playlist_buckets, sync_bucket_playlists
@@ -362,6 +362,18 @@ def logout():
     session.clear()
     session["flash_message"] = "Session cleared."
     return redirect(url_for("index"))
+
+@app.route("/debug/spotify-config")
+def debug_spotify_config():
+    return jsonify(
+        {
+            "redirect_uri": SPOTIFY_REDIRECT_URI,
+            "client_id_present": bool(SPOTIFY_CLIENT_ID),
+            "client_secret_present": bool(SPOTIFY_CLIENT_SECRET),
+            "playlist_public": PLAYLIST_PUBLIC,
+            "requested_scopes": SCOPES,
+        }
+    )
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT, debug=DEBUG_MODE)
