@@ -363,5 +363,17 @@ def logout():
     session["flash_message"] = "Session cleared."
     return redirect(url_for("index"))
 
+@app.route("/debug/spotify-config")
+def debug_spotify_config():
+    return jsonify(
+        {
+            "redirect_uri": SPOTIFY_REDIRECT_URI,
+            "client_id_present": bool(SPOTIFY_CLIENT_ID),
+            "client_secret_present": bool(SPOTIFY_CLIENT_SECRET),
+            "playlist_public": PLAYLIST_PUBLIC,
+            "requested_scopes": SCOPES,
+        }
+    )
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT, debug=DEBUG_MODE)
