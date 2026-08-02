@@ -1,4 +1,6 @@
 import json
+import sqlite3
+import time
 from classify import classify_track, normalize_text
 from db import (
     get_db,
@@ -16,29 +18,56 @@ from db import (
 from musicbrainz_client import get_recording, get_release_group, lookup_isrc, search_recording
 from spotify_client import all_saved_tracks, fetch_artists
 
+
+def commit_with_retry(db, attempts=5, base_sleep=0.5):
+    for i in range(attempts):
+        try:
+            db.commit()
+            return
+        except sqlite3.OperationalError as exc:
+            if "database is locked" not in str(exc).lower() or i == attempts - 1:
+                raise
+            time.sleep(base_sleep * (2 ** i))
+
+
 def sync_saved_library(access_token: str, spotify_user_id: str):
     db = get_db()
     items = all_saved_tracks(access_token)
     count = 0
+    failed = 0
+
     for item in items:
         track = item.get("track") or {}
         if track.get("is_local") or not track.get("id") or not track.get("uri"):
             continue
-        save_spotify_track(spotify_user_id, item)
-        count += 1
-    db.commit()
-    return {"saved_tracks": count}
+        try:
+            save_spotify_track(spotify_user_id, item)
+            commit_with_retry(db)
+            count += 1
+        except Exception:
+            failed += 1
+            try:
+                commit_with_retry(db)
+            except Exception:
+                pass
+
+    return {"saved_tracks": count, "failed_tracks": failed}
+
 
 def sync_artist_metadata(access_token: str, batch_size: int = 100):
     ids = get_unhydrated_artist_ids(batch_size)
     if not ids:
         return {"artists_updated": 0}
     artists = fetch_artists(access_token, ids)
+    db = get_db()
+    updated = 0
     for artist in artists:
         if artist and artist.get("id"):
             upsert_spotify_artist_detail(artist)
-    get_db().commit()
-    return {"artists_updated": len(artists)}
+            updated += 1
+            commit_with_retry(db)
+    return {"artists_updated": updated}
+
 
 def score_recording_candidate(track_title: str, primary_artist: str | None, track_duration_ms: int | None, candidate: dict) -> float:
     score = 0.0
@@ -58,6 +87,7 @@ def score_recording_candidate(track_title: str, primary_artist: str | None, trac
             score += 8
     return score
 
+
 def _select_release_group_id(recording: dict) -> str | None:
     releases = recording.get("releases") or []
     for release in releases:
@@ -66,9 +96,11 @@ def _select_release_group_id(recording: dict) -> str | None:
             return rg["id"]
     return None
 
+
 def _musicbrainz_access_token() -> str | None:
     row = get_token_row("musicbrainz", "self")
     return row["access_token"] if row and row["access_token"] else None
+
 
 def _enrich_rows(rows):
     db = get_db()
@@ -105,6 +137,7 @@ def _enrich_rows(rows):
 
             if not selected:
                 upsert_mb_match(spotify_track_id, "none", None, None, 0.0, "failed", "No MusicBrainz match found")
+                commit_with_retry(db)
                 failed += 1
                 continue
 
@@ -146,28 +179,33 @@ def _enrich_rows(rows):
             overrides = get_track_override_genres(spotify_track_id)
             genres = classify_track(mb_genres, spotify_genres, overrides)
             replace_track_genres(spotify_track_id, genres)
+            commit_with_retry(db)
             enriched += 1
 
         except Exception as exc:
             upsert_mb_match(spotify_track_id, "error", None, None, 0.0, "failed", str(exc))
+            commit_with_retry(db)
             failed += 1
 
-    db.commit()
     return {"tracks_enriched": enriched, "tracks_failed": failed}
+
 
 def enrich_unmatched_tracks(limit: int = 25):
     rows = get_tracks_for_enrichment(limit=limit, include_matched=False)
     return _enrich_rows(rows)
 
+
 def enrich_selected_tracks(track_ids: list[str]):
     rows = get_tracks_for_enrichment(limit=max(len(track_ids), 1), selected_ids=track_ids, include_matched=True)
     return _enrich_rows(rows)
+
 
 def sync_all_musicbrainz(limit: int = 100000):
     rows = get_tracks_for_enrichment(limit=limit, include_matched=True)
     summary = _enrich_rows(rows)
     summary["tracks_scanned"] = len(rows)
     return summary
+
 
 def reclassify_track(spotify_track_id: str):
     db = get_db()
@@ -203,5 +241,5 @@ def reclassify_track(spotify_track_id: str):
     overrides = get_track_override_genres(spotify_track_id)
     genres = classify_track(mb_genre_names, spotify_genres, overrides)
     replace_track_genres(spotify_track_id, genres)
-    db.commit()
+    commit_with_retry(db)
     return {"spotify_track_id": spotify_track_id, "genres": genres}

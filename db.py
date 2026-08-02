@@ -128,8 +128,9 @@ CREATE INDEX IF NOT EXISTS idx_track_genres_genre ON track_genres(genre);
 def get_db():
     if "db" not in g:
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-        g.db = sqlite3.connect(DB_PATH)
+        g.db = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
         g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA busy_timeout = 30000")
     return g.db
 
 
