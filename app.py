@@ -3,6 +3,7 @@ import logging
 import os
 import secrets
 from flask import Flask, redirect, render_template_string, request, session, url_for, jsonify
+import traceback
 from db import close_db, env_or_file, get_db, get_token_row, get_track_detail, get_track_override_genres, get_unmatched_tracks, init_db, replace_genre_overrides, upsert_token
 from musicbrainz_oauth import MUSICBRAINZ_CLIENT_ID, MUSICBRAINZ_REDIRECT_URI, build_mb_authorize_url, exchange_mb_code, refresh_mb_token
 from playlist_builder import build_playlist_buckets, sync_bucket_playlists
@@ -193,29 +194,55 @@ def login():
 
 @app.route("/callback")
 def callback():
-    if request.args.get("state") != session.get("oauth_state"):
-        session["flash_message"] = "OAuth state mismatch."
-        return redirect(url_for("index"))
-    code = request.args.get("code")
-    if not code:
-        session["flash_message"] = "Spotify did not return an authorization code."
-        return redirect(url_for("index"))
-    data = spotify_token_request({"grant_type": "authorization_code", "code": code, "redirect_uri": SPOTIFY_REDIRECT_URI})
-    me = get_me(data["access_token"])
-    upsert_token(
-        "spotify",
-        me["id"],
-        refresh_token=data.get("refresh_token"),
-        access_token=data.get("access_token"),
-        token_type=data.get("token_type"),
-        scope=data.get("scope", ""),
-        expires_at=None,
-    )
-    session["spotify_user_id"] = me["id"]
-    session["debug_blob"] = build_debug_snapshot(me["id"]) if DEBUG_MODE else None
-    session["flash_message"] = f"Connected Spotify account for {me.get('display_name') or me['id']}."
-    return redirect(url_for("index"))
+    try:
+        if request.args.get("state") != session.get("oauth_state"):
+            session["flash_message"] = "OAuth state mismatch."
+            logger.error(
+                "Spotify OAuth state mismatch: request_state=%r session_state=%r args=%r",
+                request.args.get("state"),
+                session.get("oauth_state"),
+                dict(request.args),
+            )
+            return redirect(url_for("index"))
 
+        code = request.args.get("code")
+        if not code:
+            session["flash_message"] = "Spotify did not return an authorization code."
+            logger.error("Spotify callback missing code: args=%r", dict(request.args))
+            return redirect(url_for("index"))
+
+        logger.info("Spotify callback received code; exchanging token")
+        data = spotify_token_request(
+            {"grant_type": "authorization_code", "code": code, "redirect_uri": SPOTIFY_REDIRECT_URI}
+        )
+        logger.info("Spotify token exchange succeeded; calling /me")
+        me = get_me(data["access_token"])
+        logger.info("Spotify /me returned user_id=%s", me.get("id"))
+
+        upsert_token(
+            "spotify",
+            me["id"],
+            refresh_token=data.get("refresh_token"),
+            access_token=data.get("access_token"),
+            token_type=data.get("token_type"),
+            scope=data.get("scope", ""),
+            expires_at=None,
+        )
+        session["spotify_user_id"] = me["id"]
+        session["debug_blob"] = build_debug_snapshot(me["id"]) if DEBUG_MODE else None
+        session["flash_message"] = f"Connected Spotify account for {me.get('display_name') or me['id']}."
+        return redirect(url_for("index"))
+
+    except Exception as exc:
+        logger.exception(
+            "Spotify callback failed: %s | args=%r | session_state=%r",
+            exc,
+            dict(request.args),
+            session.get("oauth_state"),
+        )
+        session["flash_message"] = f"Spotify callback failed: {exc}"
+        return redirect(url_for("index"))
+    
 @app.route("/musicbrainz/login")
 def mb_login():
     if not MUSICBRAINZ_CLIENT_ID or not MUSICBRAINZ_REDIRECT_URI:
@@ -227,29 +254,52 @@ def mb_login():
 
 @app.route("/musicbrainz/callback")
 def mb_callback():
-    if request.args.get("state") != session.get("mb_oauth_state"):
-        session["flash_message"] = "MusicBrainz OAuth state mismatch."
-        return redirect(url_for("index"))
-    if request.args.get("error"):
-        session["flash_message"] = f"MusicBrainz authorization failed: {request.args.get('error')}"
-        return redirect(url_for("index"))
-    code = request.args.get("code")
-    if not code:
-        session["flash_message"] = "MusicBrainz did not return an authorization code."
-        return redirect(url_for("index"))
-    token_data = exchange_mb_code(code)
-    upsert_token(
-        "musicbrainz",
-        "self",
-        refresh_token=token_data.get("refresh_token"),
-        access_token=token_data.get("access_token"),
-        token_type=token_data.get("token_type"),
-        scope=token_data.get("scope"),
-        expires_at=None,
-    )
-    session["flash_message"] = "MusicBrainz OAuth connected. Public lookups work without it, but authenticated access is now available."
-    return redirect(url_for("index"))
+    try:
+        if request.args.get("state") != session.get("mb_oauth_state"):
+            session["flash_message"] = "MusicBrainz OAuth state mismatch."
+            logger.error(
+                "MusicBrainz OAuth state mismatch: request_state=%r session_state=%r args=%r",
+                request.args.get("state"),
+                session.get("mb_oauth_state"),
+                dict(request.args),
+            )
+            return redirect(url_for("index"))
 
+        if request.args.get("error"):
+            session["flash_message"] = f"MusicBrainz authorization failed: {request.args.get('error')}"
+            logger.error("MusicBrainz auth error: %r", dict(request.args))
+            return redirect(url_for("index"))
+
+        code = request.args.get("code")
+        if not code:
+            session["flash_message"] = "MusicBrainz did not return an authorization code."
+            logger.error("MusicBrainz callback missing code: args=%r", dict(request.args))
+            return redirect(url_for("index"))
+
+        logger.info("MusicBrainz callback received code; exchanging token")
+        token_data = exchange_mb_code(code)
+        upsert_token(
+            "musicbrainz",
+            "self",
+            refresh_token=token_data.get("refresh_token"),
+            access_token=token_data.get("access_token"),
+            token_type=token_data.get("token_type"),
+            scope=token_data.get("scope"),
+            expires_at=None,
+        )
+        session["flash_message"] = "MusicBrainz OAuth connected. Public lookups work without it, but authenticated access is now available."
+        return redirect(url_for("index"))
+
+    except Exception as exc:
+        logger.exception(
+            "MusicBrainz callback failed: %s | args=%r | session_state=%r",
+            exc,
+            dict(request.args),
+            session.get("mb_oauth_state"),
+        )
+        session["flash_message"] = f"MusicBrainz callback failed: {exc}"
+        return redirect(url_for("index"))
+    
 @app.route("/run-sync")
 def run_sync():
     spotify_user_id = session.get("spotify_user_id")
