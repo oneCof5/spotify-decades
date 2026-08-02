@@ -199,6 +199,11 @@ def enrich_selected_tracks(track_ids: list[str]):
     rows = get_tracks_for_enrichment(limit=max(len(track_ids), 1), selected_ids=track_ids, include_matched=True)
     return _enrich_rows(rows)
 
+def sync_next_musicbrainz_batch(limit: int = 25):
+    rows = get_tracks_for_enrichment(limit=limit, include_matched=False)
+    summary = _enrich_rows(rows)
+    summary["tracks_scanned"] = len(rows)
+    return summary
 
 def sync_all_musicbrainz(limit: int = 100000):
     rows = get_tracks_for_enrichment(limit=limit, include_matched=True)

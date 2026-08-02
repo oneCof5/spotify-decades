@@ -3,12 +3,11 @@ import logging
 import os
 import secrets
 from flask import Flask, redirect, render_template_string, request, session, url_for, jsonify
-import traceback
 from db import close_db, env_or_file, get_db, get_token_row, get_track_detail, get_track_override_genres, get_unmatched_tracks, init_db, replace_genre_overrides, upsert_token
 from musicbrainz_oauth import MUSICBRAINZ_CLIENT_ID, MUSICBRAINZ_REDIRECT_URI, build_mb_authorize_url, exchange_mb_code, refresh_mb_token
 from playlist_builder import build_playlist_buckets, sync_bucket_playlists
 from spotify_client import SCOPES, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_REDIRECT_URI, build_authorize_url, get_me, spotify_token_request
-from sync import enrich_selected_tracks, reclassify_track, sync_all_musicbrainz, sync_artist_metadata, sync_saved_library
+from sync import enrich_selected_tracks, reclassify_track, sync_all_musicbrainz, sync_artist_metadata, sync_next_musicbrainz_batch, sync_saved_library
 
 APP_NAME = env_or_file("APP_NAME", "Spotify Decades Plus")
 SECRET_KEY = env_or_file("FLASK_SECRET_KEY", secrets.token_hex(32))
@@ -17,6 +16,7 @@ PLAYLIST_PUBLIC = env_or_file("PLAYLIST_PUBLIC", "false").lower() == "true"
 PORT = int(env_or_file("PORT", "8080"))
 DEBUG_MODE = env_or_file("APP_DEBUG", "false").lower() == "true"
 LOG_PATH = env_or_file("LOG_PATH", "/logs/app.log")
+MB_BATCH_SIZE = int(env_or_file("MB_BATCH_SIZE", "25"))
 
 os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 logging.basicConfig(
@@ -39,7 +39,7 @@ body{font-family:system-ui,sans-serif;background:#111827;color:#f9fafb;margin:0}
 {% if not connected %}<a class='btn' href='{{ url_for("login") }}'>Connect Spotify</a>{% else %}
 <div class='row'>
 <a class='btn' href='{{ url_for("run_sync") }}'>1. Sync library</a>
-<a class='btn' href='{{ url_for("run_mb_sync_all") }}'>2. Sync all with MusicBrainz</a>
+<a class='btn' href='{{ url_for("run_mb_sync_next") }}'>2. Sync next MB batch</a>
 <a class='btn' href='{{ url_for("build_all_playlists") }}'>3. Build playlists</a>
 <a class='btn btn-alt' href='{{ url_for("admin_unmatched") }}'>Admin: unmatched</a>
 <a class='btn btn-alt' href='{{ url_for("mb_login") }}'>MusicBrainz OAuth</a>
@@ -88,6 +88,7 @@ body{font-family:system-ui,sans-serif;background:#111827;color:#f9fafb;margin:0}
 </div></body></html>
 """
 
+
 def get_access_token_for_user(spotify_user_id: str) -> str:
     row = get_token_row("spotify", spotify_user_id)
     if not row:
@@ -103,6 +104,7 @@ def get_access_token_for_user(spotify_user_id: str) -> str:
         expires_at=None,
     )
     return data["access_token"]
+
 
 def get_musicbrainz_access_token() -> str | None:
     row = get_token_row("musicbrainz", "self")
@@ -124,6 +126,7 @@ def get_musicbrainz_access_token() -> str | None:
         return data.get("access_token")
     return None
 
+
 def current_profile():
     spotify_user_id = session.get("spotify_user_id")
     if not spotify_user_id:
@@ -134,6 +137,7 @@ def current_profile():
     except Exception as exc:
         logger.exception("current_profile failed: %s", exc)
         return None
+
 
 def build_debug_snapshot(spotify_user_id=None):
     if not spotify_user_id:
@@ -147,6 +151,7 @@ def build_debug_snapshot(spotify_user_id=None):
             "client_secret_present": bool(SPOTIFY_CLIENT_SECRET),
             "musicbrainz_client_id_present": bool(MUSICBRAINZ_CLIENT_ID),
             "musicbrainz_redirect_uri": MUSICBRAINZ_REDIRECT_URI,
+            "mb_batch_size": MB_BATCH_SIZE,
         },
         "session": {
             "spotify_user_id": spotify_user_id,
@@ -165,9 +170,11 @@ def build_debug_snapshot(spotify_user_id=None):
         snap["db_counts"] = counts
     return json.dumps(snap, indent=2)
 
+
 @app.before_request
 def ensure_db():
     init_db()
+
 
 @app.route("/")
 def index():
@@ -183,6 +190,7 @@ def index():
         debug=session.get("debug_blob"),
     )
 
+
 @app.route("/login")
 def login():
     if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
@@ -191,6 +199,7 @@ def login():
     state = secrets.token_urlsafe(24)
     session["oauth_state"] = state
     return redirect(build_authorize_url(state))
+
 
 @app.route("/callback")
 def callback():
@@ -212,9 +221,7 @@ def callback():
             return redirect(url_for("index"))
 
         logger.info("Spotify callback received code; exchanging token")
-        data = spotify_token_request(
-            {"grant_type": "authorization_code", "code": code, "redirect_uri": SPOTIFY_REDIRECT_URI}
-        )
+        data = spotify_token_request({"grant_type": "authorization_code", "code": code, "redirect_uri": SPOTIFY_REDIRECT_URI})
         logger.info("Spotify token exchange succeeded; calling /me")
         me = get_me(data["access_token"])
         logger.info("Spotify /me returned user_id=%s", me.get("id"))
@@ -242,7 +249,8 @@ def callback():
         )
         session["flash_message"] = f"Spotify callback failed: {exc}"
         return redirect(url_for("index"))
-    
+
+
 @app.route("/musicbrainz/login")
 def mb_login():
     if not MUSICBRAINZ_CLIENT_ID or not MUSICBRAINZ_REDIRECT_URI:
@@ -251,6 +259,7 @@ def mb_login():
     state = secrets.token_urlsafe(24)
     session["mb_oauth_state"] = state
     return redirect(build_mb_authorize_url(state))
+
 
 @app.route("/musicbrainz/callback")
 def mb_callback():
@@ -299,7 +308,8 @@ def mb_callback():
         )
         session["flash_message"] = f"MusicBrainz callback failed: {exc}"
         return redirect(url_for("index"))
-    
+
+
 @app.route("/run-sync")
 def run_sync():
     spotify_user_id = session.get("spotify_user_id")
@@ -317,6 +327,23 @@ def run_sync():
     session["debug_blob"] = build_debug_snapshot(spotify_user_id) if DEBUG_MODE else None
     return redirect(url_for("index"))
 
+
+@app.route("/run-mb-sync-next")
+def run_mb_sync_next():
+    spotify_user_id = session.get("spotify_user_id")
+    if not spotify_user_id:
+        session["flash_message"] = "Connect Spotify first."
+        return redirect(url_for("index"))
+    try:
+        summary = sync_next_musicbrainz_batch(limit=MB_BATCH_SIZE)
+        session["flash_message"] = f"MusicBrainz batch complete: enriched {summary['tracks_enriched']}, failed {summary['tracks_failed']}, scanned {summary['tracks_scanned']}."
+    except Exception as exc:
+        logger.exception("run_mb_sync_next failed: %s", exc)
+        session["flash_message"] = f"MusicBrainz batch failed: {exc}"
+    session["debug_blob"] = build_debug_snapshot(spotify_user_id) if DEBUG_MODE else None
+    return redirect(url_for("index"))
+
+
 @app.route("/run-mb-sync-all")
 def run_mb_sync_all():
     spotify_user_id = session.get("spotify_user_id")
@@ -331,6 +358,7 @@ def run_mb_sync_all():
         session["flash_message"] = f"MusicBrainz sync failed: {exc}"
     session["debug_blob"] = build_debug_snapshot(spotify_user_id) if DEBUG_MODE else None
     return redirect(url_for("index"))
+
 
 @app.route("/build-playlists")
 def build_all_playlists():
@@ -354,6 +382,7 @@ def build_all_playlists():
     session["debug_blob"] = build_debug_snapshot(spotify_user_id) if DEBUG_MODE else None
     return redirect(url_for("index"))
 
+
 @app.route("/admin/unmatched")
 def admin_unmatched():
     spotify_user_id = session.get("spotify_user_id")
@@ -368,6 +397,7 @@ def admin_unmatched():
         rows.append(row)
     return render_template_string(ADMIN_PAGE, app_name=APP_NAME, rows=rows, message=session.pop("flash_message", None))
 
+
 @app.post("/admin/enrich-selected")
 def enrich_selected_route():
     track_ids = request.form.getlist("track_ids")
@@ -378,6 +408,7 @@ def enrich_selected_route():
     session["flash_message"] = f"Selected enrichment complete: enriched {summary['tracks_enriched']}, failed {summary['tracks_failed']}."
     return redirect(url_for("admin_unmatched"))
 
+
 @app.route("/admin/track/<spotify_track_id>")
 def track_detail(spotify_track_id):
     detail = get_track_detail(spotify_track_id)
@@ -385,6 +416,7 @@ def track_detail(spotify_track_id):
         session["flash_message"] = "Track not found."
         return redirect(url_for("admin_unmatched"))
     return render_template_string(DETAIL_PAGE, app_name=APP_NAME, detail=detail, pretty=json.dumps(dict(detail), indent=2))
+
 
 @app.post("/admin/track/<spotify_track_id>/override")
 def save_override(spotify_track_id):
@@ -395,11 +427,13 @@ def save_override(spotify_track_id):
     session["flash_message"] = f"Saved {len(genres)} override genre(s) for {spotify_track_id}."
     return redirect(url_for("admin_unmatched"))
 
+
 @app.route("/admin/track/<spotify_track_id>/reclassify")
 def reclassify_route(spotify_track_id):
     result = reclassify_track(spotify_track_id)
     session["flash_message"] = f"Reclassified {spotify_track_id} into {', '.join([g[0] for g in result['genres']]) or 'no genres'}."
     return redirect(url_for("track_detail", spotify_track_id=spotify_track_id))
+
 
 @app.route("/admin/track/<spotify_track_id>/enrich")
 def enrich_one_route(spotify_track_id):
@@ -407,11 +441,13 @@ def enrich_one_route(spotify_track_id):
     session["flash_message"] = f"Track enrichment complete: enriched {summary['tracks_enriched']}, failed {summary['tracks_failed']}."
     return redirect(url_for("track_detail", spotify_track_id=spotify_track_id))
 
+
 @app.route("/logout")
 def logout():
     session.clear()
     session["flash_message"] = "Session cleared."
     return redirect(url_for("index"))
+
 
 @app.route("/debug/spotify-config")
 def debug_spotify_config():
@@ -422,8 +458,10 @@ def debug_spotify_config():
             "client_secret_present": bool(SPOTIFY_CLIENT_SECRET),
             "playlist_public": PLAYLIST_PUBLIC,
             "requested_scopes": SCOPES,
+            "mb_batch_size": MB_BATCH_SIZE,
         }
     )
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT, debug=DEBUG_MODE)
