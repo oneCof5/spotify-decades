@@ -6,8 +6,9 @@ from db import (
     get_db,
     get_token_row,
     get_track_override_genres,
-    get_tracks_for_enrichment,
+    get_tracks_for_enrichment_after,
     get_unhydrated_artist_ids,
+    get_pending_musicbrainz_count,
     replace_track_genres,
     save_spotify_track,
     upsert_mb_match,
@@ -190,26 +191,30 @@ def _enrich_rows(rows):
     return {"tracks_enriched": enriched, "tracks_failed": failed}
 
 
+def sync_next_musicbrainz_batch(limit: int = 5, cursor: str | None = None):
+    rows = get_tracks_for_enrichment_after(limit=limit, cursor=cursor, include_matched=False)
+    summary = _enrich_rows(rows)
+    summary["tracks_scanned"] = len(rows)
+    summary["next_cursor"] = rows[-1]["spotify_track_id"] if rows else cursor
+    summary["pending_remaining"] = get_pending_musicbrainz_count(after_cursor=summary["next_cursor"])
+    return summary
+
+
+def sync_all_musicbrainz(limit: int = 100000):
+    rows = get_tracks_for_enrichment_after(limit=limit, cursor=None, include_matched=True)
+    summary = _enrich_rows(rows)
+    summary["tracks_scanned"] = len(rows)
+    return summary
+
+
 def enrich_unmatched_tracks(limit: int = 25):
-    rows = get_tracks_for_enrichment(limit=limit, include_matched=False)
+    rows = get_tracks_for_enrichment_after(limit=limit, cursor=None, include_matched=False)
     return _enrich_rows(rows)
 
 
 def enrich_selected_tracks(track_ids: list[str]):
-    rows = get_tracks_for_enrichment(limit=max(len(track_ids), 1), selected_ids=track_ids, include_matched=True)
+    rows = get_tracks_for_enrichment_after(limit=max(len(track_ids), 1), cursor=None, selected_ids=track_ids, include_matched=True)
     return _enrich_rows(rows)
-
-def sync_next_musicbrainz_batch(limit: int = 25):
-    rows = get_tracks_for_enrichment(limit=limit, include_matched=False)
-    summary = _enrich_rows(rows)
-    summary["tracks_scanned"] = len(rows)
-    return summary
-
-def sync_all_musicbrainz(limit: int = 100000):
-    rows = get_tracks_for_enrichment(limit=limit, include_matched=True)
-    summary = _enrich_rows(rows)
-    summary["tracks_scanned"] = len(rows)
-    return summary
 
 
 def reclassify_track(spotify_track_id: str):

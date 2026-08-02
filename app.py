@@ -3,7 +3,7 @@ import logging
 import os
 import secrets
 from flask import Flask, redirect, render_template_string, request, session, url_for, jsonify
-from db import close_db, env_or_file, get_db, get_token_row, get_track_detail, get_track_override_genres, get_unmatched_tracks, init_db, replace_genre_overrides, upsert_token
+from db import close_db, env_or_file, get_db, get_pending_musicbrainz_count, get_token_row, get_track_detail, get_track_override_genres, get_unmatched_tracks, init_db, replace_genre_overrides, upsert_token, build_cursor_from_row
 from musicbrainz_oauth import MUSICBRAINZ_CLIENT_ID, MUSICBRAINZ_REDIRECT_URI, build_mb_authorize_url, exchange_mb_code, refresh_mb_token
 from playlist_builder import build_playlist_buckets, sync_bucket_playlists
 from spotify_client import SCOPES, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_REDIRECT_URI, build_authorize_url, get_me, spotify_token_request
@@ -16,7 +16,7 @@ PLAYLIST_PUBLIC = env_or_file("PLAYLIST_PUBLIC", "false").lower() == "true"
 PORT = int(env_or_file("PORT", "8080"))
 DEBUG_MODE = env_or_file("APP_DEBUG", "false").lower() == "true"
 LOG_PATH = env_or_file("LOG_PATH", "/logs/app.log")
-MB_BATCH_SIZE = int(env_or_file("MB_BATCH_SIZE", "25"))
+MB_BATCH_SIZE = int(env_or_file("MB_BATCH_SIZE", "5"))
 
 os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 logging.basicConfig(
@@ -44,8 +44,10 @@ body{font-family:system-ui,sans-serif;background:#111827;color:#f9fafb;margin:0}
 <a class='btn btn-alt' href='{{ url_for("admin_unmatched") }}'>Admin: unmatched</a>
 <a class='btn btn-alt' href='{{ url_for("mb_login") }}'>MusicBrainz OAuth</a>
 <a class='btn btn-alt' href='{{ url_for("logout") }}'>Disconnect</a>
-</div>{% endif %}</div>
+</div>{% endif %}
+</div>
 {% if message %}<div class='card'><strong>Status:</strong> {{ message }}</div>{% endif %}
+{% if progress %}<div class='card'><strong>MusicBrainz queue:</strong> {{ progress.pending }} pending, current cursor: {{ progress.cursor or 'none' }}</div>{% endif %}
 {% if profile %}<div class='card'><h2>Connected account</h2><p>{{ profile.get('display_name') or profile.get('id') }} ({{ profile.get('id') }})</p></div>{% endif %}
 {% if result_rows %}<div class='card'><h2>Latest playlist sync</h2><table><thead><tr><th>Type</th><th>Label</th><th>Tracks</th><th>Action</th><th>Playlist</th></tr></thead><tbody>{% for row in result_rows %}<tr><td>{{ row['type'] }}</td><td>{{ row['label'] }}</td><td>{{ row['count'] }}</td><td>{{ row['action'] }}</td><td><a href='{{ row['url'] }}' target='_blank' rel='noopener noreferrer'>{{ row['name'] }}</a></td></tr>{% endfor %}</tbody></table></div>{% endif %}
 {% if debug and debug_enabled %}<div class='card'><h2>Debug</h2><pre>{{ debug }}</pre></div>{% endif %}
@@ -94,15 +96,7 @@ def get_access_token_for_user(spotify_user_id: str) -> str:
     if not row:
         raise RuntimeError("No Spotify refresh token stored for this user.")
     data = spotify_token_request({"grant_type": "refresh_token", "refresh_token": row["refresh_token"]})
-    upsert_token(
-        "spotify",
-        spotify_user_id,
-        refresh_token=data.get("refresh_token") or row["refresh_token"],
-        access_token=data.get("access_token"),
-        token_type=data.get("token_type"),
-        scope=row["scope"] or data.get("scope"),
-        expires_at=None,
-    )
+    upsert_token("spotify", spotify_user_id, refresh_token=data.get("refresh_token") or row["refresh_token"], access_token=data.get("access_token"), token_type=data.get("token_type"), scope=row["scope"] or data.get("scope"), expires_at=None)
     return data["access_token"]
 
 
@@ -114,15 +108,7 @@ def get_musicbrainz_access_token() -> str | None:
         return row["access_token"]
     if row["refresh_token"]:
         data = refresh_mb_token(row["refresh_token"])
-        upsert_token(
-            "musicbrainz",
-            "self",
-            refresh_token=data.get("refresh_token") or row["refresh_token"],
-            access_token=data.get("access_token"),
-            token_type=data.get("token_type"),
-            scope=data.get("scope"),
-            expires_at=None,
-        )
+        upsert_token("musicbrainz", "self", refresh_token=data.get("refresh_token") or row["refresh_token"], access_token=data.get("access_token"), token_type=data.get("token_type"), scope=data.get("scope"), expires_at=None)
         return data.get("access_token")
     return None
 
@@ -156,6 +142,7 @@ def build_debug_snapshot(spotify_user_id=None):
         "session": {
             "spotify_user_id": spotify_user_id,
             "musicbrainz_connected": bool(get_musicbrainz_access_token()),
+            "mb_cursor": session.get("mb_sync_cursor"),
         },
     }
     if spotify_user_id:
@@ -179,16 +166,13 @@ def ensure_db():
 @app.route("/")
 def index():
     profile = current_profile()
-    return render_template_string(
-        PAGE,
-        app_name=APP_NAME,
-        connected=bool(profile),
-        profile=profile,
-        debug_enabled=DEBUG_MODE,
-        message=session.pop("flash_message", None),
-        result_rows=session.pop("latest_results", None),
-        debug=session.get("debug_blob"),
-    )
+    progress = None
+    if session.get("spotify_user_id"):
+        progress = {
+            "pending": get_pending_musicbrainz_count(after_cursor=session.get("mb_sync_cursor")),
+            "cursor": session.get("mb_sync_cursor"),
+        }
+    return render_template_string(PAGE, app_name=APP_NAME, connected=bool(profile), profile=profile, progress=progress, debug_enabled=DEBUG_MODE, message=session.pop("flash_message", None), result_rows=session.pop("latest_results", None), debug=session.get("debug_blob"))
 
 
 @app.route("/login")
@@ -206,47 +190,20 @@ def callback():
     try:
         if request.args.get("state") != session.get("oauth_state"):
             session["flash_message"] = "OAuth state mismatch."
-            logger.error(
-                "Spotify OAuth state mismatch: request_state=%r session_state=%r args=%r",
-                request.args.get("state"),
-                session.get("oauth_state"),
-                dict(request.args),
-            )
             return redirect(url_for("index"))
-
         code = request.args.get("code")
         if not code:
             session["flash_message"] = "Spotify did not return an authorization code."
-            logger.error("Spotify callback missing code: args=%r", dict(request.args))
             return redirect(url_for("index"))
-
-        logger.info("Spotify callback received code; exchanging token")
         data = spotify_token_request({"grant_type": "authorization_code", "code": code, "redirect_uri": SPOTIFY_REDIRECT_URI})
-        logger.info("Spotify token exchange succeeded; calling /me")
         me = get_me(data["access_token"])
-        logger.info("Spotify /me returned user_id=%s", me.get("id"))
-
-        upsert_token(
-            "spotify",
-            me["id"],
-            refresh_token=data.get("refresh_token"),
-            access_token=data.get("access_token"),
-            token_type=data.get("token_type"),
-            scope=data.get("scope", ""),
-            expires_at=None,
-        )
+        upsert_token("spotify", me["id"], refresh_token=data.get("refresh_token"), access_token=data.get("access_token"), token_type=data.get("token_type"), scope=data.get("scope", ""), expires_at=None)
         session["spotify_user_id"] = me["id"]
         session["debug_blob"] = build_debug_snapshot(me["id"]) if DEBUG_MODE else None
         session["flash_message"] = f"Connected Spotify account for {me.get('display_name') or me['id']}."
         return redirect(url_for("index"))
-
     except Exception as exc:
-        logger.exception(
-            "Spotify callback failed: %s | args=%r | session_state=%r",
-            exc,
-            dict(request.args),
-            session.get("oauth_state"),
-        )
+        logger.exception("Spotify callback failed: %s", exc)
         session["flash_message"] = f"Spotify callback failed: {exc}"
         return redirect(url_for("index"))
 
@@ -266,46 +223,20 @@ def mb_callback():
     try:
         if request.args.get("state") != session.get("mb_oauth_state"):
             session["flash_message"] = "MusicBrainz OAuth state mismatch."
-            logger.error(
-                "MusicBrainz OAuth state mismatch: request_state=%r session_state=%r args=%r",
-                request.args.get("state"),
-                session.get("mb_oauth_state"),
-                dict(request.args),
-            )
             return redirect(url_for("index"))
-
         if request.args.get("error"):
             session["flash_message"] = f"MusicBrainz authorization failed: {request.args.get('error')}"
-            logger.error("MusicBrainz auth error: %r", dict(request.args))
             return redirect(url_for("index"))
-
         code = request.args.get("code")
         if not code:
             session["flash_message"] = "MusicBrainz did not return an authorization code."
-            logger.error("MusicBrainz callback missing code: args=%r", dict(request.args))
             return redirect(url_for("index"))
-
-        logger.info("MusicBrainz callback received code; exchanging token")
         token_data = exchange_mb_code(code)
-        upsert_token(
-            "musicbrainz",
-            "self",
-            refresh_token=token_data.get("refresh_token"),
-            access_token=token_data.get("access_token"),
-            token_type=token_data.get("token_type"),
-            scope=token_data.get("scope"),
-            expires_at=None,
-        )
+        upsert_token("musicbrainz", "self", refresh_token=token_data.get("refresh_token"), access_token=token_data.get("access_token"), token_type=token_data.get("token_type"), scope=token_data.get("scope"), expires_at=None)
         session["flash_message"] = "MusicBrainz OAuth connected. Public lookups work without it, but authenticated access is now available."
         return redirect(url_for("index"))
-
     except Exception as exc:
-        logger.exception(
-            "MusicBrainz callback failed: %s | args=%r | session_state=%r",
-            exc,
-            dict(request.args),
-            session.get("mb_oauth_state"),
-        )
+        logger.exception("MusicBrainz callback failed: %s", exc)
         session["flash_message"] = f"MusicBrainz callback failed: {exc}"
         return redirect(url_for("index"))
 
@@ -335,8 +266,9 @@ def run_mb_sync_next():
         session["flash_message"] = "Connect Spotify first."
         return redirect(url_for("index"))
     try:
-        summary = sync_next_musicbrainz_batch(limit=MB_BATCH_SIZE)
-        session["flash_message"] = f"MusicBrainz batch complete: enriched {summary['tracks_enriched']}, failed {summary['tracks_failed']}, scanned {summary['tracks_scanned']}."
+        summary = sync_next_musicbrainz_batch(limit=MB_BATCH_SIZE, cursor=session.get("mb_sync_cursor"))
+        session["mb_sync_cursor"] = summary.get("next_cursor")
+        session["flash_message"] = f"MusicBrainz batch complete: enriched {summary['tracks_enriched']}, failed {summary['tracks_failed']}, scanned {summary['tracks_scanned']}, pending {summary['pending_remaining']} remaining."
     except Exception as exc:
         logger.exception("run_mb_sync_next failed: %s", exc)
         session["flash_message"] = f"MusicBrainz batch failed: {exc}"

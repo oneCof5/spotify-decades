@@ -122,6 +122,7 @@ CREATE INDEX IF NOT EXISTS idx_track_artists_track ON track_artists(spotify_trac
 CREATE INDEX IF NOT EXISTS idx_spotify_tracks_isrc ON spotify_tracks(isrc);
 CREATE INDEX IF NOT EXISTS idx_mb_matches_status ON mb_track_matches(status);
 CREATE INDEX IF NOT EXISTS idx_track_genres_genre ON track_genres(genre);
+CREATE INDEX IF NOT EXISTS idx_spotify_tracks_name ON spotify_tracks(name, spotify_track_id);
 """
 
 
@@ -273,7 +274,7 @@ def get_unhydrated_artist_ids(limit: int = 50):
     return [r[0] for r in rows]
 
 
-def get_tracks_for_enrichment(limit: int = 100, selected_ids: list[str] | None = None, include_matched: bool = False):
+def get_tracks_for_enrichment_after(limit: int = 100, cursor: str | None = None, selected_ids: list[str] | None = None, include_matched: bool = False):
     db = get_db()
     where = "WHERE 1=1"
     params: list = []
@@ -283,9 +284,10 @@ def get_tracks_for_enrichment(limit: int = 100, selected_ids: list[str] | None =
         params.extend(selected_ids)
     elif not include_matched:
         where += " AND (mm.spotify_track_id IS NULL OR mm.status IN ('pending', 'failed'))"
-
+    if cursor:
+        where += " AND (st.name, st.spotify_track_id) > (?, ?)"
+        params.extend([cursor_name_from_cursor(cursor), cursor])
     params.append(limit)
-
     return db.execute(
         f"""
         SELECT st.spotify_track_id, st.name, st.duration_ms, st.isrc, st.album_name, st.album_release_date,
@@ -296,10 +298,44 @@ def get_tracks_for_enrichment(limit: int = 100, selected_ids: list[str] | None =
         LEFT JOIN mb_track_matches mm ON mm.spotify_track_id = st.spotify_track_id
         {where}
         GROUP BY st.spotify_track_id
+        ORDER BY st.name, st.spotify_track_id
         LIMIT ?
         """,
         params,
     ).fetchall()
+
+
+def cursor_name_from_cursor(cursor: str) -> str:
+    return cursor.split("::", 1)[0] if "::" in cursor else ""
+
+
+def build_cursor_from_row(row) -> str:
+    return f"{row['name']}::{row['spotify_track_id']}"
+
+
+def get_pending_musicbrainz_count(after_cursor: str | None = None):
+    db = get_db()
+    if after_cursor:
+        name = cursor_name_from_cursor(after_cursor)
+        rowid = after_cursor.split("::", 1)[1] if "::" in after_cursor else after_cursor
+        return db.execute(
+            """
+            SELECT COUNT(*)
+            FROM spotify_tracks st
+            LEFT JOIN mb_track_matches mm ON mm.spotify_track_id = st.spotify_track_id
+            WHERE (mm.spotify_track_id IS NULL OR mm.status IN ('pending', 'failed'))
+              AND (st.name, st.spotify_track_id) > (?, ?)
+            """,
+            (name, rowid),
+        ).fetchone()[0]
+    return db.execute(
+        """
+        SELECT COUNT(*)
+        FROM spotify_tracks st
+        LEFT JOIN mb_track_matches mm ON mm.spotify_track_id = st.spotify_track_id
+        WHERE mm.spotify_track_id IS NULL OR mm.status IN ('pending', 'failed')
+        """,
+    ).fetchone()[0]
 
 
 def upsert_mb_match(spotify_track_id: str, match_method: str, mb_recording_id: str | None,
